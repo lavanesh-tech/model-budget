@@ -7,8 +7,10 @@ dependencies = [
     "fastapi>=0.141",
     "uvicorn[standard]>=0.52",
     "pydantic-settings>=2.0",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "alembic>=1.13",
 ]
-
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
