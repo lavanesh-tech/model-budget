@@ -3,11 +3,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import create_engine, pool
 
+import app.models  # noqa: F401
 from app.db import Base, build_database_url
-
-# Import model modules here before Alembic reads Base.metadata.
-# Example after models are created:
-# from app.models import team  # noqa: F401
 
 config = context.config
 
