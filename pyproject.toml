@@ -13,6 +13,11 @@ dependencies = [
     "argon2-cffi>=23.1",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "httpx>=2.12",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
