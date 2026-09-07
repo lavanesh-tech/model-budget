@@ -128,6 +128,17 @@ def build_pricing_catalog(
 
 # Synthetic nonzero prices used only by the free mock provider.
 # Rates are dollars per 1,000,000 tokens.
+#
+# The "openai" / "gpt-5-mini" entry below is REAL pricing, verified
+# against the official OpenAI model page
+# (https://developers.openai.com/api/docs/models/gpt-5-mini) on
+# 2026-09-07: $0.25 per 1,000,000 input tokens, $2.00 per 1,000,000
+# output tokens (standard, non-batch rate). OpenAI pricing changes over
+# time and is not guaranteed to remain current -- this entry MUST be
+# re-verified against the live OpenAI pricing page
+# (https://developers.openai.com/api/docs/pricing) before any production
+# deployment, and periodically thereafter. Do not treat this hard-coded
+# rate as permanently accurate.
 _CATALOG_ENTRIES = (
     ModelPricing(
         provider="mock",
@@ -140,6 +151,12 @@ _CATALOG_ENTRIES = (
         model="mock-large",
         input_price_per_million=Decimal("0.05"),
         output_price_per_million=Decimal("0.10"),
+    ),
+    ModelPricing(
+        provider="openai",
+        model="gpt-5-mini",
+        input_price_per_million=Decimal("0.25"),
+        output_price_per_million=Decimal("2.00"),
     ),
 )
 
