@@ -5,64 +5,68 @@ caller-owned transaction.
 
 Transaction ownership: every function here takes a Session and never
 commits or rolls it back. On success, the caller commits. On ANY failure
-after the claim (a raised exception), the caller must roll back -- this
-module never catches its own exceptions except to translate a failed
-refund into SettlementIntegrityError, so an exception here always means
-"roll back the whole transaction," restoring the idempotency record to
-PENDING, the budget to its pre-settlement value, and leaving no
-UsageRecord behind, since none of the writes below have committed.
+after the claim (a raised exception), the caller must roll back.
 
-Authoritative accounting data (SECURITY-RELEVANT): settle_success and
-settle_failure accept ONLY idempotency_key_id and outcome data from the
-caller -- never team_id, budget_period_start, or reserved_cost. After a
-winning claim_settlement() call, this module re-selects the
-IdempotencyKey row (same Session, same open transaction, with
-execution_options(populate_existing=True) to guarantee a fresh read
-rather than a possibly-stale identity-map hit) and derives team_id,
-budget_period_start, and reserved_cost from THAT row. No additional
-locking is required for this re-select: the winning claim's UPDATE
-already holds the row lock, and a losing caller never reaches this code
-path at all (it returns early with claimed=False). This eliminates any
-possibility of a caller supplying a mismatched team, period, or inflated
-reservation -- those values are never taken from the caller's arguments,
-because the public functions do not accept them at all. The
-actual_cost <= reserved_cost check therefore compares against the
-DATABASE's own reserved_cost; if it fails, the raised
-SettlementCostExceededError happens after the claim, by necessity (the
-authoritative reserved_cost isn't known until after a successful claim),
-and relies on the caller's rollback to restore PENDING.
+Authoritative accounting data: settle_success and settle_failure accept
+ONLY idempotency_key_id and outcome data from the caller -- never
+team_id, budget_period_start, or reserved_cost. After a winning
+claim_settlement() call, this module re-selects the IdempotencyKey row
+(same Session, same open transaction, execution_options(populate_existing
+=True)) and derives team_id, budget_period_start, and reserved_cost from
+THAT row.
 
-Provider-call boundary: settlement must be called AFTER a provider
-attempt (success or failure) has already completed -- never while a
-provider call is in flight. This module makes no network calls and does
-not import anything from app.providers or app.services.routing, keeping
-it fully provider-independent -- required so the same settlement code
-path settles both MockProvider-driven test runs and, starting in a later
-step, real OpenAI-driven production runs without modification.
+--- Step 30 v3 correction: cost-overrun handling no longer discards
+    known billed usage ---
 
-Fault-injection hooks (test-only, no-op in production): three
-module-level no-op functions -- _before_refund_hook,
-_before_usage_insert_hook, and _after_usage_flush_hook -- are called at
-fixed points inside settle_success/settle_failure. In production they do
-nothing. Tests patch them with unittest.mock.patch(..., side_effect=...)
-to inject a fault at an exact point while still calling the REAL,
-unmodified settle_success/settle_failure -- so rollback behavior is
-verified against the actual service, never a hand-reimplemented copy of
-it in the test script.
+The previous revision raised SettlementCostExceededError when
+actual_cost > reserved_cost, forcing the caller to abandon the request
+and record a full refund with actual_cost=0 -- discarding the one piece
+of evidence (the true actual_cost) that we actually had. That was wrong:
+it destroyed real accounting information to make an edge case easier to
+handle.
 
-Retry-accounting note (Step 27 interaction): app.services.routing may
-perform multiple attempts across multiple candidates for one logical
-request. `actual_cost` passed into settle_success/settle_failure here is
+Corrected policy, and it needed NO schema change (usage_records.
+actual_cost has only an `actual_cost >= 0` CHECK -- nothing ties it to
+reserved_cost, so a larger true value is perfectly representable):
+
+  - settle_success/settle_failure now ALWAYS record the actual_cost the
+    caller supplies -- the true, known cost -- in usage_records.actual_cost,
+    even when it exceeds reserved_cost.
+  - The TEAM is never overcharged: the refund is
+    max(reserved_cost - actual_cost, Decimal("0")). When actual_cost >=
+    reserved_cost, the refund is exactly zero -- the team is charged
+    exactly the reservation, no more, no less.
+  - The gap between the true actual_cost and what the team was charged
+    is NOT separately flagged with its own column -- it does not need to
+    be: reading idempotency_keys.reserved_cost alongside
+    usage_records.actual_cost for the same request already tells you
+    whether (and by how much) the true cost exceeded the reservation.
+    `actual_cost > reserved_cost` on a joined row IS the audit signal.
+  - This is a deliberate POLICY choice, stated plainly: when the true
+    upstream cost exceeds what was reserved, the PLATFORM (not the team)
+    absorbs the difference. The team's budget invariant (never charged
+    more than it explicitly reserved) is preserved. This is a business
+    policy decision, not a technical inevitability -- a different
+    project could choose to bill the team the true cost and let a
+    reservation be exceeded, but that would require loosening
+    reserve_budget/refund_budget's own invariants, which this project
+    has deliberately kept strict throughout every prior step.
+
+SettlementCostExceededError is kept defined (for any external code that
+may still reference the type) but is no longer raised by this module.
+
+Fault-injection hooks (test-only, no-op in production): unchanged from
+the prior revision -- _before_refund_hook, _before_usage_insert_hook,
+_after_usage_flush_hook.
+
+Retry-accounting note (unchanged): `actual_cost` passed in here is
 expected to represent the TOTAL billable cost across every attempt that
-was actually billed by a provider -- NOT just the cost of the final
-attempt. This module does not compute that total itself; it is supplied
-by the caller (a future orchestration layer, and eventually the real
-OpenAI integration in Step 29). This module's only responsibility
-regarding cost is to fail closed: actual_cost must never exceed the
-authoritative reserved_cost. Whether a single worst-case reservation is
-large enough to cover cumulative cost across retries is explicitly NOT
-solved here -- matching the same gap flagged in app.services.routing's
-module docstring.
+was actually billed by a provider for a SUCCESSFUL settlement. For a
+settle_failure call after every candidate/attempt was exhausted, this
+module has no way to know what OpenAI may have billed for attempts that
+never returned a usable result -- see app.api.chat_completions' own
+docstring for how that uncertainty is represented to the client (never
+as a confident "zero cost was confirmed").
 """
 
 import json
@@ -89,20 +93,18 @@ class SettlementValidationError(ValueError):
 
 
 class SettlementCostExceededError(SettlementValidationError):
-    """Raised when actual_cost > the AUTHORITATIVE reserved_cost read from
-    the claimed database row. Fail-closed: no reservation may be
-    overspent. Raised after the claim (the authoritative value is only
-    known then) -- the caller's rollback restores the idempotency record
-    to PENDING.
+    """No longer raised by this module -- see the module docstring for
+    the corrected cost-overrun policy (cap the team's charge, preserve
+    the true actual_cost). Kept defined only for backward compatibility
+    with any external code that may still catch this type.
     """
 
 
 class SettlementIntegrityError(RuntimeError):
     """Raised when a refund that should have succeeded (a matching budget
     row was expected to exist) instead returned False from
-    refund_budget -- an unexpected data-integrity condition, not a normal
-    control-flow outcome. Propagates immediately so the caller rolls back
-    the whole transaction.
+    refund_budget -- an unexpected data-integrity condition. Propagates
+    immediately so the caller rolls back the whole transaction.
     """
 
 
@@ -111,6 +113,10 @@ class SettlementResult:
     claimed: bool
     refunded_amount: Decimal | None
     usage_record_id: uuid.UUID | None
+    cost_capped: bool = False
+    """True if actual_cost exceeded reserved_cost and the team's charge
+    was capped at the reservation (refunded_amount == 0 in that case).
+    """
 
 
 def _validate_uuid(label: str, value) -> None:
@@ -167,13 +173,6 @@ def _validate_error_code(value) -> None:
 
 
 def _validate_response_snapshot(value) -> None:
-    """Requires a dict whose contents are strictly JSON-compatible: a
-    successful json.dumps(value, allow_nan=False) call, with no
-    TypeError/ValueError. This rejects sets, NaN, Infinity, and any other
-    non-JSON-serializable value nested anywhere inside the snapshot.
-    Never includes the snapshot's own contents in the raised error
-    message -- only the generic fact that validation failed.
-    """
     if value is None:
         raise SettlementValidationError("response_snapshot is required for a successful settlement")
     if not isinstance(value, dict):
@@ -188,10 +187,6 @@ def _validate_response_snapshot(value) -> None:
 
 
 def _validate_final_pair(final_provider, final_model) -> None:
-    """final_provider and final_model must either both be None or both be
-    valid, non-blank, length-bounded strings -- never one present and the
-    other missing.
-    """
     if (final_provider is None) != (final_model is None):
         raise SettlementValidationError("final_provider and final_model must both be None or both be provided")
     if final_provider is not None:
@@ -200,12 +195,6 @@ def _validate_final_pair(final_provider, final_model) -> None:
 
 
 def _load_authoritative_row(db: Session, idempotency_key_id: uuid.UUID) -> IdempotencyKey:
-    """Re-select the IdempotencyKey row within the current transaction,
-    immediately after a winning claim. See module docstring: this is a
-    read of our own uncommitted write, requires no additional locking,
-    and is the sole source of team_id/budget_period_start/reserved_cost
-    for the rest of settlement.
-    """
     return db.execute(
         select(IdempotencyKey)
         .where(IdempotencyKey.id == idempotency_key_id)
@@ -213,13 +202,13 @@ def _load_authoritative_row(db: Session, idempotency_key_id: uuid.UUID) -> Idemp
     ).scalar_one()
 
 
-def _compute_refund_amount(reserved_cost: Decimal, actual_cost: Decimal) -> Decimal:
-    if actual_cost > reserved_cost:
-        raise SettlementCostExceededError(
-            "actual_cost exceeds the authoritative reserved_cost -- refusing to settle "
-            "(fail closed; caller must roll back to restore PENDING)"
-        )
-    return reserved_cost - actual_cost
+def _compute_refund_amount(reserved_cost: Decimal, actual_cost: Decimal) -> tuple[Decimal, bool]:
+    """Returns (refund_amount, cost_capped). Never raises for an overrun
+    -- see module docstring for the corrected policy.
+    """
+    if actual_cost >= reserved_cost:
+        return Decimal("0"), actual_cost > reserved_cost
+    return reserved_cost - actual_cost, False
 
 
 def _apply_refund_if_needed(db: Session, row: IdempotencyKey, refund_amount: Decimal) -> Decimal | None:
@@ -234,28 +223,15 @@ def _apply_refund_if_needed(db: Session, row: IdempotencyKey, refund_amount: Dec
     return refund_amount
 
 
-# --- Fault-injection hook points -------------------------------------
-# All three are no-ops in production. Tests patch them via
-# unittest.mock.patch(..., side_effect=SomeException(...)) to force a
-# rollback at an exact stage while still exercising the REAL
-# settle_success/settle_failure implementation end to end.
-
 def _before_refund_hook(db: Session, row: IdempotencyKey) -> None:
-    """Called immediately after the winning claim and authoritative row
-    load, before the refund step runs."""
     return None
 
 
 def _before_usage_insert_hook(db: Session, row: IdempotencyKey) -> None:
-    """Called immediately after the refund step completes, before the
-    UsageRecord is constructed and added."""
     return None
 
 
 def _after_usage_flush_hook(db: Session, row: IdempotencyKey, record: UsageRecord) -> None:
-    """Called immediately after the UsageRecord has been flushed
-    (assigned a real id), before settle_success/settle_failure return
-    control to the caller (who will then commit)."""
     return None
 
 
@@ -274,16 +250,10 @@ def settle_success(
     latency_ms: int,
     fallback_used: bool,
 ) -> SettlementResult:
-    """Settle a successfully-completed request. Every input is validated
-    before any SQL executes, EXCEPT the actual_cost <= reserved_cost
-    check, which necessarily happens after the claim (see module
-    docstring). If the claim is won: loads the authoritative
-    IdempotencyKey row, refunds reserved_cost - actual_cost (skipping the
-    refund call entirely if that difference is zero), inserts one
-    successful UsageRecord, and returns claimed=True. If another caller
-    already settled this record, or the ID does not exist, returns
-    claimed=False with no other side effects. Never commits or rolls
-    back; the caller owns the transaction.
+    """Settle a successfully-completed request. If actual_cost exceeds
+    the authoritative reserved_cost, the team's charge is capped at the
+    reservation (refund=0) and the TRUE actual_cost is still recorded --
+    see module docstring. Never commits or rolls back.
     """
     _validate_uuid("idempotency_key_id", idempotency_key_id)
     _validate_cost("actual_cost", actual_cost, allow_zero=True)
@@ -304,7 +274,7 @@ def settle_success(
         return SettlementResult(claimed=False, refunded_amount=None, usage_record_id=None)
 
     row = _load_authoritative_row(db, idempotency_key_id)
-    refund_amount = _compute_refund_amount(row.reserved_cost, actual_cost)
+    refund_amount, cost_capped = _compute_refund_amount(row.reserved_cost, actual_cost)
 
     _before_refund_hook(db, row)
     _apply_refund_if_needed(db, row, refund_amount)
@@ -328,7 +298,9 @@ def settle_success(
     db.flush()
     _after_usage_flush_hook(db, row, record)
 
-    return SettlementResult(claimed=True, refunded_amount=refund_amount, usage_record_id=record.id)
+    return SettlementResult(
+        claimed=True, refunded_amount=refund_amount, usage_record_id=record.id, cost_capped=cost_capped
+    )
 
 
 def settle_failure(
@@ -346,17 +318,10 @@ def settle_failure(
     latency_ms: int,
     fallback_used: bool = False,
 ) -> SettlementResult:
-    """Settle a request whose provider attempts ultimately failed.
-    actual_cost is normally Decimal("0") (no billable usage occurred),
-    but may be positive if a provider billed for a failed attempt --
-    still validated against the AUTHORITATIVE reserved_cost read from the
-    claimed row, never a caller-supplied value. final_provider and
-    final_model must both be None or both be valid strings; a mismatched
-    pair is rejected. Refunds reserved_cost - actual_cost (normally the
-    full reservation), inserts one failed UsageRecord, and never sets
-    IdempotencyKey.response_snapshot (claim_settlement stores SQL NULL
-    for a FAILED settlement). Never commits or rolls back; the caller
-    owns the transaction.
+    """Settle a request whose provider attempts ultimately failed. Same
+    cost-capping policy as settle_success applies if actual_cost happens
+    to be positive (e.g. a provider billed for a failed attempt) and
+    exceeds reserved_cost. Never commits or rolls back.
     """
     _validate_uuid("idempotency_key_id", idempotency_key_id)
     _validate_cost("actual_cost", actual_cost, allow_zero=True)
@@ -374,7 +339,7 @@ def settle_failure(
         return SettlementResult(claimed=False, refunded_amount=None, usage_record_id=None)
 
     row = _load_authoritative_row(db, idempotency_key_id)
-    refund_amount = _compute_refund_amount(row.reserved_cost, actual_cost)
+    refund_amount, cost_capped = _compute_refund_amount(row.reserved_cost, actual_cost)
 
     _before_refund_hook(db, row)
     _apply_refund_if_needed(db, row, refund_amount)
@@ -398,4 +363,6 @@ def settle_failure(
     db.flush()
     _after_usage_flush_hook(db, row, record)
 
-    return SettlementResult(claimed=True, refunded_amount=refund_amount, usage_record_id=record.id)
+    return SettlementResult(
+        claimed=True, refunded_amount=refund_amount, usage_record_id=record.id, cost_capped=cost_capped
+    )

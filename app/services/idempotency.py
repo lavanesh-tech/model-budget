@@ -44,6 +44,16 @@ reservation amount is > 0, and must skip the budget call entirely when it
 is exactly 0 -- this module does not call budget.py, so it cannot enforce
 that rule itself; it is documented here for whoever wires the two
 together.
+
+Step 30 v3 addition: validate_idempotency_key_format() is a public
+wrapper around the SAME validation acquire_idempotency_slot already
+applies internally (_validate_idempotency_key). It exists so a caller
+(app.api.chat_completions) can validate an Idempotency-Key header BEFORE
+performing any external, potentially-billable work (e.g. an OpenAI
+token-counting call) -- without duplicating the regex/length rules here.
+This is the smallest possible change that lets a caller validate early
+while keeping this module the single source of truth for what a valid
+idempotency key looks like.
 """
 
 import hashlib
@@ -103,6 +113,15 @@ def _validate_idempotency_key(value: str) -> None:
         raise IdempotencyValidationError(
             "idempotency_key must contain only letters, digits, '.', '_', or '-'"
         )
+
+
+def validate_idempotency_key_format(value: str) -> None:
+    """Public entry point so callers can validate an Idempotency-Key
+    BEFORE doing any external/billable work. Raises
+    IdempotencyValidationError on the same terms acquire_idempotency_slot
+    itself enforces.
+    """
+    _validate_idempotency_key(value)
 
 
 def _validate_request_hash(value: str) -> None:

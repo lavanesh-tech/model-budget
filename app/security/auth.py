@@ -45,10 +45,18 @@ def _extract_raw_key(authorization: str | None) -> str:
     return token
 
 
-def get_current_auth(
-    authorization: str | None = Header(default=None),
-    db: Session = Depends(get_db),
-) -> AuthContext:
+def authenticate(db: Session, authorization: str | None) -> AuthContext:
+    """Core authentication logic, usable with any Session the caller
+    manages -- NOT tied to a specific request's FastAPI dependency-
+    injection lifecycle (a Depends()-yielded Session stays open until the
+    whole request handler returns, which is unsuitable for an endpoint
+    that must release its database connection before a slow external
+    call). get_current_auth (below) is a thin FastAPI-dependency wrapper
+    around this for endpoints happy to keep their request-scoped session
+    open for the whole request. app.api.chat_completions calls this
+    directly with its own short-lived Session instead, closing it
+    immediately after authentication succeeds.
+    """
     raw_key = _extract_raw_key(authorization)
 
     try:
@@ -89,3 +97,10 @@ def get_current_auth(
     # without adding a synchronous write to every authenticated request.
 
     return AuthContext(team=team, api_key=api_key)
+
+
+def get_current_auth(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> AuthContext:
+    return authenticate(db, authorization)

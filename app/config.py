@@ -25,23 +25,18 @@ class Settings(BaseSettings):
     # scripts/bootstrap_team.py and stored only as Argon2id hashes in
     # api_keys.secret_hash (see app/security/api_keys.py); there is no
     # single gateway-wide client-key setting to configure here.
-    #
-    # SecretStr keeps the raw value out of repr()/str()/logs. Optional
-    # (None) so the app can run against only the free MockProvider
-    # without ever configuring OpenAI. When present, must be non-blank --
-    # see the validator below.
     openai_api_key: SecretStr | None = None
-
-    # Which OpenAI model this gateway requests when the "openai" provider
-    # is selected. See app/services/pricing.py for the verified pricing
-    # entry that must stay in sync with this default, and its own note
-    # that OpenAI pricing must be reviewed before production deployment.
     openai_model: str = "gpt-5-mini"
-
-    # All three below are optional and, when provided, must be non-blank.
     openai_base_url: str | None = None
     openai_organization: str | None = None
     openai_project: str | None = None
+
+    # Step 30 v3 addition: how many attempts app.services.routing.RetryPolicy
+    # permits per candidate. Default 3 for normal operation. Set to 1 via
+    # OPENAI_RETRY_MAX_ATTEMPTS=1 for a live smoke test, so a single manual
+    # request cannot silently become multiple real, separately-billed
+    # OpenAI generation calls.
+    openai_retry_max_attempts: int = 3
 
     @field_validator("openai_api_key")
     @classmethod
@@ -62,6 +57,15 @@ class Settings(BaseSettings):
     def _optional_openai_field_not_blank(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("value must not be blank if provided")
+        return value
+
+    @field_validator("openai_retry_max_attempts")
+    @classmethod
+    def _retry_max_attempts_in_range(cls, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"openai_retry_max_attempts must be a plain int, got {type(value).__name__}")
+        if value < 1 or value > 10:
+            raise ValueError("openai_retry_max_attempts must be between 1 and 10")
         return value
 
 
