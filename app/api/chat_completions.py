@@ -1,6 +1,6 @@
 """
 POST /v1/chat/completions -- the complete authenticated inference
-workflow. This is the fifth revision; see the corrections/additions
+workflow. This is the sixth revision; see the corrections/additions
 below (earlier revision notes are preserved for history).
 
 --- Step 30 v3 corrections ---
@@ -64,7 +64,7 @@ fixed set of safe-field log events at each major transition. Every call
 site passes an explicit, reviewed set of keyword arguments via
 extra={...} -- never a whole request/response/row object -- so it is
 structurally impossible for a prompt, completion, Authorization header,
-secret_hash, or (Step 32) Redis URL to end up in a log line by accident.
+secret_hash, or Redis URL to end up in a log line by accident.
 
 --- Step 32 (Redis redesign) ---
 
@@ -75,41 +75,27 @@ deployed later as AWS ElastiCache for Redis; Postgres remains the
 durable system of record for everything else). No Postgres model,
 migration, or table exists for rate limiting.
 
-Placement: checked immediately after replay resolution (existing.kind
-== "none", i.e. only for a genuinely new request), BEFORE unknown-model
-validation, token counting, or any reservation work -- the cheapest
-possible rejection point among the "new request only" checks, and one
-that correctly never blocks a replay.
+Placement: checked immediately after replay resolution, BEFORE
+unknown-model validation, token counting, or any reservation work.
 
-Atomicity and multi-instance correctness: app.services.rate_limit's
-RedisRateLimiter runs one atomic Lua script per check (sliding-window
-log via a Redis sorted set) -- see that module's docstring for the full
-algorithm and rationale. Redis, not any single FastAPI process, is the
-shared state, so this is correct under concurrent requests from any
-number of application instances.
+Fail-closed policy: RateLimitUnavailableError maps to a 503
+"rate_limiter_unavailable" response -- the request is REJECTED, never
+silently allowed through unlimited.
 
-Fail-closed policy (explicit, tested): RateLimitUnavailableError (Redis
-unreachable or erroring) is mapped to a 503 "rate_limiter_unavailable"
-response -- the request is REJECTED, never silently allowed through
-unlimited. See app.services.rate_limit's module docstring for why this
-is the deliberate choice for a budget-protection gateway specifically.
+--- Step 33 addition: Prometheus metrics ---
 
-Correlation ID reuse: the Lua script's unique per-request sorted-set
-member is the SAME request_id already assigned by
-app.main.RequestIDMiddleware (via request.state.request_id) -- reusing
-the existing correlation ID rather than generating a second one.
-
-Headers: standard X-RateLimit-Limit / X-RateLimit-Remaining /
-X-RateLimit-Reset headers are set on EVERY genuinely-new request's
-response (allowed or rejected), plus Retry-After specifically on the
-429 response.
-
-Rejected-request guarantee: because this check happens before token
-counting, budget reservation, idempotency acquisition, or any provider
-call, a 429 (or a 503 from a failed-closed unavailable check) is
-guaranteed to have caused none of: an OpenAI call, a budget reservation,
-a new idempotency row, or a usage record -- a structural property of the
-code's ordering, not a separately enforced check.
+Every terminal outcome of this endpoint -- every distinct return/raise
+point -- calls app.metrics.record_chat_completion_outcome(...) with one
+of a small, fixed set of outcome label strings, alongside the existing
+structured-log call at that same point (never instead of it). On a
+successful settlement, record_chat_completion_cost(...) additionally
+records the real actual_cost (and, when known, the reservation gap) as
+an in-process, in-memory Prometheus counter/histogram -- see
+app.metrics's own module docstring for why this is monitoring-only and
+never a financial record (PostgreSQL usage_records remains that).
+Nothing added here performs any I/O, and no label anywhere in this file
+carries team_id, idempotency_key_id, a prompt, or any other unbounded
+value.
 """
 
 import asyncio
@@ -126,6 +112,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
+from app.metrics import record_chat_completion_cost, record_chat_completion_outcome
 from app.models import IdempotencyKey
 from app.models.enums import IdempotencyStatus
 from app.security.auth import authenticate
@@ -565,26 +552,31 @@ async def create_chat_completion(
     #        replay or new, since it is about well-formedness, not
     #        current server configuration. ---
     if body.stream:
+        record_chat_completion_outcome("streaming_not_supported")
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={"code": "streaming_not_supported", "message": "stream=true is not supported"},
         )
     if not body.prompt.strip():
+        record_chat_completion_outcome("invalid_request")
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "invalid_request", "message": "prompt must not be blank"},
         )
     if len(body.prompt) > _MAX_PROMPT_CHARS:
+        record_chat_completion_outcome("invalid_request")
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "invalid_request", "message": f"prompt must not exceed {_MAX_PROMPT_CHARS} characters"},
         )
     if body.max_tokens < 1 or body.max_tokens > _MAX_MAX_TOKENS:
+        record_chat_completion_outcome("invalid_request")
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "invalid_request", "message": f"max_tokens must be between 1 and {_MAX_MAX_TOKENS}"},
         )
     if idempotency_key is None or not idempotency_key.strip():
+        record_chat_completion_outcome("idempotency_key_required")
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={"code": "idempotency_key_required", "message": "Idempotency-Key header is required"},
@@ -592,6 +584,7 @@ async def create_chat_completion(
     try:
         validate_idempotency_key_format(idempotency_key)
     except IdempotencyValidationError:
+        record_chat_completion_outcome("invalid_idempotency_key")
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_idempotency_key", "message": "Idempotency-Key is invalid"},
@@ -608,6 +601,7 @@ async def create_chat_completion(
             {"model": body.model, "prompt": body.prompt, "max_tokens": body.max_tokens}
         )
     except IdempotencyValidationError:
+        record_chat_completion_outcome("invalid_request")
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "invalid_request", "message": "request payload could not be fingerprinted"},
@@ -621,6 +615,7 @@ async def create_chat_completion(
     )
     if existing.kind == "response":
         logger.info("replay_completed", extra={"team_id": str(team_id)})
+        record_chat_completion_outcome("replay_completed")
         response.headers["Idempotent-Replayed"] = "true"
         return existing.response
     if existing.kind == "error":
@@ -628,6 +623,7 @@ async def create_chat_completion(
             "replay_or_conflict_error",
             extra={"team_id": str(team_id), "status_code": existing.error.status_code},
         )
+        record_chat_completion_outcome(existing.error.detail["code"])
         raise existing.error
     # existing.kind == "none" -- genuinely new request. Continue below.
 
@@ -649,6 +645,7 @@ async def create_chat_completion(
         # license to allow unlimited requests through -- see
         # app.services.rate_limit's module docstring.
         logger.error("rate_limiter_unavailable", extra={"team_id": str(team_id)})
+        record_chat_completion_outcome("rate_limiter_unavailable")
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -667,6 +664,7 @@ async def create_chat_completion(
                 "window_seconds": rate_limit_window_seconds,
             },
         )
+        record_chat_completion_outcome("rate_limited")
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
@@ -690,6 +688,7 @@ async def create_chat_completion(
         pricing = get_model_pricing("openai", model)
     except UnknownModelError:
         logger.info("unknown_model_rejected", extra={"team_id": str(team_id), "model": model})
+        record_chat_completion_outcome("unknown_model")
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={"code": "unknown_model", "message": "requested model is not supported"},
@@ -700,6 +699,7 @@ async def create_chat_completion(
         validate_route_against_registry(registry, route)
     except RoutingValidationError:
         logger.info("unknown_model_rejected", extra={"team_id": str(team_id), "model": model})
+        record_chat_completion_outcome("unknown_model")
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={"code": "unknown_model", "message": "requested model is not supported by this deployment"},
@@ -715,18 +715,21 @@ async def create_chat_completion(
                 prompt_token_count = await count_fn(model, body.prompt)
         except TimeoutError:
             logger.warning("token_counting_timeout", extra={"team_id": str(team_id), "model": model})
+            record_chat_completion_outcome("provider_unavailable")
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "provider_unavailable", "message": "token counting timed out; retry later"},
             ) from None
         except RetryableProviderError:
             logger.warning("token_counting_failed_retryable", extra={"team_id": str(team_id), "model": model})
+            record_chat_completion_outcome("provider_unavailable")
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "provider_unavailable", "message": "token counting failed; retry later"},
             ) from None
         except NonRetryableProviderError:
             logger.warning("token_counting_failed_non_retryable", extra={"team_id": str(team_id), "model": model})
+            record_chat_completion_outcome("provider_error")
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY,
                 detail={"code": "provider_error", "message": "token counting was rejected by the provider"},
@@ -744,6 +747,7 @@ async def create_chat_completion(
             pricing, prompt_token_count * attempts, body.max_tokens * attempts
         )
     except PricingValidationError:
+        record_chat_completion_outcome("invalid_request")
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
@@ -759,6 +763,7 @@ async def create_chat_completion(
     )
     if isinstance(txn1_result, ChatCompletionResponseBody):
         logger.info("replay_completed_race", extra={"team_id": str(team_id)})
+        record_chat_completion_outcome("replay_completed_race")
         response.headers["Idempotent-Replayed"] = "true"
         return txn1_result
 
@@ -794,9 +799,11 @@ async def create_chat_completion(
         )
         replay = await _resolve_authoritative_state_if_not_claimed(session_factory, idempotency_key_id, settle_result)
         if replay is not None:
+            record_chat_completion_outcome("replay_completed_race")
             response.headers["Idempotent-Replayed"] = "true"
             return replay
         if last_category in (FailureCategory.RETRYABLE_PROVIDER_ERROR, FailureCategory.TIMEOUT):
+            record_chat_completion_outcome("provider_unavailable")
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={
@@ -808,6 +815,7 @@ async def create_chat_completion(
                     ),
                 },
             ) from None
+        record_chat_completion_outcome("provider_error")
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             detail={
@@ -833,8 +841,10 @@ async def create_chat_completion(
         )
         replay = await _resolve_authoritative_state_if_not_claimed(session_factory, idempotency_key_id, settle_result)
         if replay is not None:
+            record_chat_completion_outcome("replay_completed_race")
             response.headers["Idempotent-Replayed"] = "true"
             return replay
+        record_chat_completion_outcome("internal_error")
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "internal_error", "message": "an unexpected internal error occurred"},
@@ -872,8 +882,10 @@ async def create_chat_completion(
         )
         replay = await _resolve_authoritative_state_if_not_claimed(session_factory, idempotency_key_id, settle_result)
         if replay is not None:
+            record_chat_completion_outcome("replay_completed_race")
             response.headers["Idempotent-Replayed"] = "true"
             return replay
+        record_chat_completion_outcome("internal_error")
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "internal_error", "message": "an unexpected internal error occurred"},
@@ -908,8 +920,10 @@ async def create_chat_completion(
         )
         replay = await _resolve_authoritative_state_if_not_claimed(session_factory, idempotency_key_id, settle_result)
         if replay is not None:
+            record_chat_completion_outcome("replay_completed_race")
             response.headers["Idempotent-Replayed"] = "true"
             return replay
+        record_chat_completion_outcome("internal_error")
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "internal_error", "message": "an unexpected internal error occurred"},
@@ -926,6 +940,7 @@ async def create_chat_completion(
     )
     replay = await _resolve_authoritative_state_if_not_claimed(session_factory, idempotency_key_id, settle_result)
     if replay is not None:
+        record_chat_completion_outcome("replay_completed_race")
         response.headers["Idempotent-Replayed"] = "true"
         return replay
 
@@ -937,4 +952,6 @@ async def create_chat_completion(
             "actual_cost": str(actual_cost),
         },
     )
+    record_chat_completion_outcome("success")
+    record_chat_completion_cost(model=model, actual_cost=actual_cost, reserved_cost=reserved_cost)
     return response_body

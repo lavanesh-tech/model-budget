@@ -7,12 +7,14 @@ import redis.asyncio as redis_asyncio
 from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.chat_completions import router as chat_completions_router
 from app.config import get_settings
 from app.db import SessionLocal
 from app.logging_config import configure_logging, new_request_id, set_request_id
+from app.metrics import http_request_duration_seconds, http_requests_total
 from app.providers.openai import build_production_provider_registry
 from app.services.rate_limit import RedisRateLimiter
 from app.services.routing import RetryPolicy
@@ -36,6 +38,17 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     one correlation ID serves both purposes, deliberately, rather than
     inventing a second one. The ID is echoed back as X-Request-ID on the
     response, including on error responses.
+
+    Step 33: this same middleware also records the two HTTP-level
+    Prometheus metrics (app.metrics.http_requests_total and
+    http_request_duration_seconds). `request.url.path` is used directly
+    as the "path" label -- safe here specifically because this
+    application has exactly two routes (/health, /v1/chat/completions),
+    neither with a path parameter, so the label's value set is small and
+    fixed. A future route with a path parameter (e.g. /v1/teams/{id})
+    would need to switch to the route TEMPLATE rather than the raw path,
+    to avoid an unbounded-cardinality label -- noted here so that
+    constraint travels with any future route addition.
     """
 
     async def dispatch(
@@ -53,14 +66,22 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
         except Exception:
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            elapsed_seconds = time.perf_counter() - start
+            elapsed_ms = int(elapsed_seconds * 1000)
             logger.exception(
                 "request_unhandled_exception",
                 extra={"method": request.method, "path": request.url.path, "elapsed_ms": elapsed_ms},
             )
+            http_requests_total.labels(
+                method=request.method, path=request.url.path, status_code="500"
+            ).inc()
+            http_request_duration_seconds.labels(
+                method=request.method, path=request.url.path
+            ).observe(elapsed_seconds)
             raise
         response.headers["X-Request-ID"] = request_id
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        elapsed_seconds = time.perf_counter() - start
+        elapsed_ms = int(elapsed_seconds * 1000)
         logger.info(
             "request_completed",
             extra={
@@ -70,6 +91,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
                 "elapsed_ms": elapsed_ms,
             },
         )
+        http_requests_total.labels(
+            method=request.method, path=request.url.path, status_code=str(response.status_code)
+        ).inc()
+        http_request_duration_seconds.labels(
+            method=request.method, path=request.url.path
+        ).observe(elapsed_seconds)
         return response
 
 
@@ -191,3 +218,12 @@ app.add_exception_handler(RequestValidationError, _validation_exception_handler)
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    """Prometheus text-exposition endpoint. No authentication (see
+    app.metrics module docstring). Reads only in-process counters/
+    histograms -- no Postgres, Redis, or OpenAI I/O occurs here.
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
