@@ -43,7 +43,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     Prometheus metrics (app.metrics.http_requests_total and
     http_request_duration_seconds). `request.url.path` is used directly
     as the "path" label -- safe here specifically because this
-    application has exactly two routes (/health, /v1/chat/completions),
+    application has exactly three routes (/health, /v1/chat/completions, /metrics),
     neither with a path parameter, so the label's value set is small and
     fixed. A future route with a path parameter (e.g. /v1/teams/{id})
     would need to switch to the route TEMPLATE rather than the raw path,

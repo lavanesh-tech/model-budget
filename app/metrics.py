@@ -4,7 +4,7 @@ structured JSON logs from Step 31.
 
 Cardinality discipline (read before adding any new label): every label
 used here has a small, BOUNDED set of possible values known at
-code-review time -- HTTP method, route path (this app has exactly two
+code-review time -- HTTP method, route path (this app has exactly three
 routes, neither with path parameters), a small fixed status-code set,
 a small closed set of named outcome strings, and the configured OpenAI
 model name (effectively one value per deployment). team_id,
