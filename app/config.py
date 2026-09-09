@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 
 from pydantic import SecretStr, field_validator
@@ -31,12 +32,14 @@ class Settings(BaseSettings):
     openai_organization: str | None = None
     openai_project: str | None = None
 
-    # Step 30 v3 addition: how many attempts app.services.routing.RetryPolicy
-    # permits per candidate. Default 3 for normal operation. Set to 1 via
-    # OPENAI_RETRY_MAX_ATTEMPTS=1 for a live smoke test, so a single manual
-    # request cannot silently become multiple real, separately-billed
-    # OpenAI generation calls.
+    # Step 30 v3: how many attempts app.services.routing.RetryPolicy
+    # permits per candidate. Default 3. Set to 1 via
+    # OPENAI_RETRY_MAX_ATTEMPTS=1 for a live smoke test.
     openai_retry_max_attempts: int = 3
+
+    # Step 31: log verbosity for app.logging_config.configure_logging().
+    # Must be a real Python logging level name.
+    log_level: str = "INFO"
 
     @field_validator("openai_api_key")
     @classmethod
@@ -67,6 +70,16 @@ class Settings(BaseSettings):
         if value < 1 or value > 10:
             raise ValueError("openai_retry_max_attempts must be between 1 and 10")
         return value
+
+    @field_validator("log_level")
+    @classmethod
+    def _log_level_is_valid(cls, value: str) -> str:
+        candidate = value.strip().upper()
+        if not hasattr(logging, candidate) or not isinstance(getattr(logging, candidate), int):
+            raise ValueError(
+                f"log_level must be a real logging level name (e.g. DEBUG, INFO, WARNING, ERROR), got {value!r}"
+            )
+        return candidate
 
 
 @lru_cache

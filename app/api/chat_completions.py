@@ -87,9 +87,24 @@ recognition of this state once the row's TTL lapses. The accurate
 guarantee: idempotent database acquisition with at-most-one active
 owner during normal execution, not exactly-once execution across an
 arbitrary crash, and not exactly-once OpenAI billing.
+
+--- Step 31 addition ---
+
+Structured logging: one logger ("app.chat_completions") emits a small,
+fixed set of safe-field log events at each major transition (received,
+authenticated, replay outcome, provider outcome, settlement outcome).
+Every call site below passes an explicit, reviewed set of keyword
+arguments via extra={...} -- never a whole request/response/row object
+-- so it is structurally impossible for a prompt, completion,
+Authorization header, or secret_hash to end up in a log line by
+accident: nothing that broad is ever in scope at a logging call site.
+The request_id itself is attached automatically by app.logging_config's
+filter (see app.main.RequestIDMiddleware); nothing here needs to know
+about it directly.
 """
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -137,6 +152,7 @@ from app.services.routing import (
 from app.services.settlement import SettlementResult, settle_failure, settle_success
 
 router = APIRouter()
+logger = logging.getLogger("app.chat_completions")
 
 _DEFAULT_IDEMPOTENCY_TTL = timedelta(minutes=5)
 _MAX_PROMPT_CHARS = 20_000
@@ -450,9 +466,24 @@ async def _settle_and_resolve(
     """
     fn = _settle_success_sync if success else _settle_failure_sync
     try:
-        return await asyncio.to_thread(fn, session_factory, idempotency_key_id, **kwargs)
+        result = await asyncio.to_thread(fn, session_factory, idempotency_key_id, **kwargs)
     except Exception:
+        logger.error(
+            "settlement_unresolved",
+            extra={"idempotency_key_id": str(idempotency_key_id), "attempted": "success" if success else "failure"},
+        )
         raise _unresolved_settlement_error(idempotency_key_id) from None
+    logger.info(
+        "settlement_completed",
+        extra={
+            "idempotency_key_id": str(idempotency_key_id),
+            "attempted": "success" if success else "failure",
+            "claimed": result.claimed,
+            "refunded_amount": str(result.refunded_amount) if result.refunded_amount is not None else None,
+            "cost_capped": result.cost_capped,
+        },
+    )
+    return result
 
 
 async def _resolve_authoritative_state_if_not_claimed(
@@ -466,6 +497,7 @@ async def _resolve_authoritative_state_if_not_claimed(
     """
     if settle_result.claimed:
         return None
+    logger.info("settlement_lost_race", extra={"idempotency_key_id": str(idempotency_key_id)})
     status_value, snapshot, error_code = await asyncio.to_thread(
         _fetch_authoritative_state_sync, session_factory, idempotency_key_id
     )
@@ -534,6 +566,7 @@ async def create_chat_completion(
     # --- 2. Authentication: own short-lived session, off the event loop. ---
     auth = await asyncio.to_thread(_authenticate_sync, session_factory, authorization)
     team_id = auth.team.id
+    logger.info("authenticated", extra={"team_id": str(team_id)})
 
     # --- 3. Fingerprint from EXACTLY what the client sent (body.model,
     #        which may be None) -- never the server-resolved default, so
@@ -555,9 +588,14 @@ async def create_chat_completion(
         _resolve_existing_row_sync, session_factory, team_id, idempotency_key, request_hash
     )
     if existing.kind == "response":
+        logger.info("replay_completed", extra={"team_id": str(team_id)})
         response.headers["Idempotent-Replayed"] = "true"
         return existing.response
     if existing.kind == "error":
+        logger.info(
+            "replay_or_conflict_error",
+            extra={"team_id": str(team_id), "status_code": existing.error.status_code},
+        )
         raise existing.error
     # existing.kind == "none" -- genuinely new request. Continue below.
 
@@ -567,6 +605,7 @@ async def create_chat_completion(
     try:
         pricing = get_model_pricing("openai", model)
     except UnknownModelError:
+        logger.info("unknown_model_rejected", extra={"team_id": str(team_id), "model": model})
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={"code": "unknown_model", "message": "requested model is not supported"},
@@ -576,6 +615,7 @@ async def create_chat_completion(
         route = build_route([RouteCandidate("openai", model)])
         validate_route_against_registry(registry, route)
     except RoutingValidationError:
+        logger.info("unknown_model_rejected", extra={"team_id": str(team_id), "model": model})
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={"code": "unknown_model", "message": "requested model is not supported by this deployment"},
@@ -590,16 +630,19 @@ async def create_chat_completion(
             async with asyncio.timeout(_COUNTING_TIMEOUT_MS / 1000):
                 prompt_token_count = await count_fn(model, body.prompt)
         except TimeoutError:
+            logger.warning("token_counting_timeout", extra={"team_id": str(team_id), "model": model})
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "provider_unavailable", "message": "token counting timed out; retry later"},
             ) from None
         except RetryableProviderError:
+            logger.warning("token_counting_failed_retryable", extra={"team_id": str(team_id), "model": model})
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"code": "provider_unavailable", "message": "token counting failed; retry later"},
             ) from None
         except NonRetryableProviderError:
+            logger.warning("token_counting_failed_non_retryable", extra={"team_id": str(team_id), "model": model})
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY,
                 detail={"code": "provider_error", "message": "token counting was rejected by the provider"},
@@ -631,16 +674,35 @@ async def create_chat_completion(
         _run_txn1_sync, session_factory, team_id, idempotency_key, request_hash, reserved_cost
     )
     if isinstance(txn1_result, ChatCompletionResponseBody):
+        logger.info("replay_completed_race", extra={"team_id": str(team_id)})
         response.headers["Idempotent-Replayed"] = "true"
         return txn1_result
 
     idempotency_key_id = txn1_result.idempotency_key_id
+    logger.info(
+        "reservation_acquired",
+        extra={
+            "team_id": str(team_id),
+            "idempotency_key_id": str(idempotency_key_id),
+            "model": model,
+            "reserved_cost": str(reserved_cost),
+        },
+    )
 
     # --- Provider execution: no database session held during this call. ---
     try:
         route_result = await execute_route(registry, route, body.prompt, body.max_tokens, retry_policy, timeout_ms)
     except AllCandidatesFailedError as exc:
         last_category = exc.attempts[-1].failure_category if exc.attempts else None
+        logger.warning(
+            "provider_all_candidates_failed",
+            extra={
+                "team_id": str(team_id),
+                "idempotency_key_id": str(idempotency_key_id),
+                "attempt_count": len(exc.attempts),
+                "last_failure_category": last_category.value if last_category else None,
+            },
+        )
         settle_result = await _settle_and_resolve(
             session_factory, idempotency_key_id, success=False,
             actual_cost=Decimal("0"), error_code="RETRIES_EXHAUSTED_COST_UNKNOWN",
@@ -677,8 +739,16 @@ async def create_chat_completion(
     except asyncio.CancelledError:
         # Preserve cancellation exactly. The reservation is deliberately
         # left untouched: we do not know OpenAI's billing outcome.
+        logger.info(
+            "request_cancelled",
+            extra={"team_id": str(team_id), "idempotency_key_id": str(idempotency_key_id)},
+        )
         raise
     except Exception:
+        logger.exception(
+            "provider_unexpected_exception",
+            extra={"team_id": str(team_id), "idempotency_key_id": str(idempotency_key_id)},
+        )
         settle_result = await _settle_and_resolve(
             session_factory, idempotency_key_id, success=False,
             actual_cost=Decimal("0"), error_code="INTERNAL_ERROR",
@@ -693,6 +763,20 @@ async def create_chat_completion(
             detail={"code": "internal_error", "message": "an unexpected internal error occurred"},
         ) from None
 
+    logger.info(
+        "provider_call_succeeded",
+        extra={
+            "team_id": str(team_id),
+            "idempotency_key_id": str(idempotency_key_id),
+            "final_provider": route_result.final_provider,
+            "final_model": route_result.final_model,
+            "fallback_used": route_result.fallback_used,
+            "prompt_tokens": route_result.result.prompt_tokens,
+            "completion_tokens": route_result.result.completion_tokens,
+            "total_latency_ms": route_result.total_latency_ms,
+        },
+    )
+
     # --- Actual cost, computed FIRST from authoritative provider usage,
     #     before anything else that could fail -- so it is never lost. ---
     try:
@@ -703,6 +787,10 @@ async def create_chat_completion(
         # Genuinely last-resort: even the known, real token counts could
         # not be priced. actual_cost is not knowable here; distinctly
         # labeled from every other failure code.
+        logger.exception(
+            "cost_calculation_failed",
+            extra={"team_id": str(team_id), "idempotency_key_id": str(idempotency_key_id)},
+        )
         settle_result = await _settle_and_resolve(
             session_factory, idempotency_key_id, success=False,
             actual_cost=Decimal("0"), error_code="COST_CALCULATION_FAILED",
@@ -735,6 +823,10 @@ async def create_chat_completion(
         # A real completion was produced and actual_cost IS known (computed
         # above) -- settle with the REAL cost, never zero, even though the
         # response body itself could not be constructed.
+        logger.exception(
+            "response_construction_failed",
+            extra={"team_id": str(team_id), "idempotency_key_id": str(idempotency_key_id)},
+        )
         settle_result = await _settle_and_resolve(
             session_factory, idempotency_key_id, success=False,
             actual_cost=actual_cost, error_code="RESPONSE_CONSTRUCTION_FAILED",
@@ -766,4 +858,12 @@ async def create_chat_completion(
         response.headers["Idempotent-Replayed"] = "true"
         return replay
 
+    logger.info(
+        "request_succeeded",
+        extra={
+            "team_id": str(team_id),
+            "idempotency_key_id": str(idempotency_key_id),
+            "actual_cost": str(actual_cost),
+        },
+    )
     return response_body
