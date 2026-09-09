@@ -1,106 +1,115 @@
 """
 POST /v1/chat/completions -- the complete authenticated inference
-workflow. This is the third revision; see the corrections below.
+workflow. This is the fifth revision; see the corrections/additions
+below (earlier revision notes are preserved for history).
 
 --- Step 30 v3 corrections ---
 
-Replay-first ordering (fixes: a replay of an old COMPLETED/FAILED
-request could be wrongly rejected by "new request" checks): the
-handler now resolves an EXISTING idempotency record (by team_id +
-idempotency_key) BEFORE doing anything that only makes sense for a
+Replay-first ordering: an EXISTING idempotency record (by team_id +
+idempotency_key) is resolved BEFORE anything that only makes sense for a
 genuinely new request -- unknown-model validation, budget-period
-lookup, token counting, and reservation sizing. A request replaying an
-already-COMPLETED result returns the stored snapshot even if the
-model has since been removed from the registry, or the budget period
-that funded the original request has since ended -- exactly matching
-how a real payment-idempotency system (e.g. Stripe's) behaves: the
-stored result is authoritative, current server config is irrelevant to
-replaying it.
+lookup, token counting, reservation sizing, AND (Step 32) rate
+limiting. A request replaying an already-COMPLETED result returns the
+stored snapshot even if the model has since been removed from the
+registry, the budget period that funded it has since ended, or the team
+is currently rate-limited -- the stored result is authoritative, current
+server config/state is irrelevant to replaying it.
 
-Fingerprint stability when model is omitted (fixes: a fingerprint that
-depended on the RESOLVED default model would silently change if the
-server's configured default model ever changed, breaking replay of a
-request that omitted `model`): the fingerprint is computed from
-`body.model` EXACTLY as the client sent it (which may be None), never
-from the server-resolved default. Two requests are "the same request"
-based on what the client actually specified, not on what the server's
-current configuration happens to resolve that to.
+Fingerprint stability when model is omitted: the fingerprint is computed
+from `body.model` EXACTLY as the client sent it (which may be None),
+never from the server-resolved default.
 
-Idempotency-key format validated before any external call (fixes: a
-malformed key could previously trigger a real OpenAI token-counting
-call before ever being rejected): `validate_idempotency_key_format` is
-called immediately after checking the header is present, before
-authentication even runs.
+Idempotency-key format validated before any external call:
+`validate_idempotency_key_format` runs immediately after checking the
+header is present, before authentication even runs.
 
 Token counting -- explicit timeout, safe error handling, cancellation
-preserved (fixes: an unguarded, unhandled await): the authoritative
-token-counting call now runs inside its own `asyncio.timeout(...)` and
-its exceptions are explicitly caught and mapped to safe HTTP responses,
-exactly like the main provider call is. `asyncio.CancelledError` is
-never caught. It is skipped entirely for any request that turns out to
-already have an existing idempotency row (a replay/conflict/in-progress
-case never needs a token count at all).
+preserved: runs inside its own `asyncio.timeout(...)` with exceptions
+explicitly caught and mapped to safe HTTP responses.
+`asyncio.CancelledError` is never caught, and counting is skipped
+entirely for any request with an existing idempotency row.
 
-Cost-overrun / response-construction-failure handling (fixes: known
-billed usage being replaced with actual_cost=0): actual_cost is now
+Cost-overrun / response-construction-failure handling: actual_cost is
 computed from the provider's real returned usage IMMEDIATELY after a
-successful call, before anything else that could fail. If ONLY response
-construction fails afterward, the already-computed, REAL actual_cost is
-still used when settling -- never zero. See app.services.settlement's
-own module docstring for the full accounting policy: the team is never
-charged more than its reservation (refund capped at zero on overrun),
-but the true actual_cost is always recorded, never discarded.
+successful call, before anything else that could fail. See
+app.services.settlement's own module docstring for the full accounting
+policy.
 
 claimed=False inspected on EVERY settlement call, not only the success
-path (fixes: failure-settlement paths previously ignored this): a
-shared helper resolves and returns the authoritative stored state
-whenever a settlement call reports claimed=False, whether that call was
-settle_success or settle_failure.
+path.
 
-Uncertain upstream cost, honestly labeled (fixes: an exhausted-retries
-failure implied a "confirmed" zero cost): when every route candidate
-is exhausted (timeouts/connection failures across retries), this
-project genuinely does not know whether OpenAI billed for any of the
-failed attempts. The team is not charged for this (a deliberate policy
-choice -- see app.services.settlement), but the stored error_code and
-the client-facing message now say so honestly ("could not be
-confirmed"), rather than implying the zero was a verified fact. This is
-distinct from `settlement_unresolved` (below), which is about OUR OWN
-database state being unresolved, not OpenAI's.
+Uncertain upstream cost, honestly labeled: an exhausted-retries failure
+never implies a "confirmed" zero cost.
 
-settlement_unresolved vs. confirmed failure (unchanged from v2, restated):
-if a settlement attempt itself raises (fails to commit), that is
-DISTINCT from a confirmed, committed refund -- the client is told the
-accounting state is unresolved and is explicitly NOT invited to retry,
-since the reservation's fate is unknown, not confirmed released.
+settlement_unresolved vs. confirmed failure: distinguished explicitly --
+a settlement attempt that itself fails to commit is never reported to
+the client as a confirmed refund.
 
-Async execution boundary (unchanged from v2): every synchronous block
-runs via `await asyncio.to_thread(...)`. Only genuinely async I/O
-(execute_route, the token-counting call) runs directly on the event
-loop.
+Async execution boundary: every synchronous (Postgres) block runs via
+`await asyncio.to_thread(...)`. Genuinely async I/O -- execute_route,
+token counting, and (Step 32) the Redis rate-limit check -- is awaited
+directly on the event loop, since none of it is blocking.
 
-Crash window (unchanged, restated): if the process crashes after
-Transaction 1 commits but before Transaction 2 ever runs, the
-idempotency row is left PENDING with its reservation deducted.
-app.services.idempotency's EXPIRED_PENDING outcome is the only
-recognition of this state once the row's TTL lapses. The accurate
-guarantee: idempotent database acquisition with at-most-one active
-owner during normal execution, not exactly-once execution across an
-arbitrary crash, and not exactly-once OpenAI billing.
+Crash window: if the process crashes after Transaction 1 commits but
+before Transaction 2 ever runs, the idempotency row is left PENDING with
+its reservation deducted. The accurate guarantee: idempotent database
+acquisition with at-most-one active owner during normal execution, not
+exactly-once execution across an arbitrary crash, and not exactly-once
+OpenAI billing.
 
 --- Step 31 addition ---
 
 Structured logging: one logger ("app.chat_completions") emits a small,
-fixed set of safe-field log events at each major transition (received,
-authenticated, replay outcome, provider outcome, settlement outcome).
-Every call site below passes an explicit, reviewed set of keyword
-arguments via extra={...} -- never a whole request/response/row object
--- so it is structurally impossible for a prompt, completion,
-Authorization header, or secret_hash to end up in a log line by
-accident: nothing that broad is ever in scope at a logging call site.
-The request_id itself is attached automatically by app.logging_config's
-filter (see app.main.RequestIDMiddleware); nothing here needs to know
-about it directly.
+fixed set of safe-field log events at each major transition. Every call
+site passes an explicit, reviewed set of keyword arguments via
+extra={...} -- never a whole request/response/row object -- so it is
+structurally impossible for a prompt, completion, Authorization header,
+secret_hash, or (Step 32) Redis URL to end up in a log line by accident.
+
+--- Step 32 (Redis redesign) ---
+
+Backend: PostgreSQL was the original Step 32 design; this REPLACES it
+entirely with Redis, for the standard distributed-rate-limiting pattern
+this project is meant to demonstrate (Redis for ephemeral rate state,
+deployed later as AWS ElastiCache for Redis; Postgres remains the
+durable system of record for everything else). No Postgres model,
+migration, or table exists for rate limiting.
+
+Placement: checked immediately after replay resolution (existing.kind
+== "none", i.e. only for a genuinely new request), BEFORE unknown-model
+validation, token counting, or any reservation work -- the cheapest
+possible rejection point among the "new request only" checks, and one
+that correctly never blocks a replay.
+
+Atomicity and multi-instance correctness: app.services.rate_limit's
+RedisRateLimiter runs one atomic Lua script per check (sliding-window
+log via a Redis sorted set) -- see that module's docstring for the full
+algorithm and rationale. Redis, not any single FastAPI process, is the
+shared state, so this is correct under concurrent requests from any
+number of application instances.
+
+Fail-closed policy (explicit, tested): RateLimitUnavailableError (Redis
+unreachable or erroring) is mapped to a 503 "rate_limiter_unavailable"
+response -- the request is REJECTED, never silently allowed through
+unlimited. See app.services.rate_limit's module docstring for why this
+is the deliberate choice for a budget-protection gateway specifically.
+
+Correlation ID reuse: the Lua script's unique per-request sorted-set
+member is the SAME request_id already assigned by
+app.main.RequestIDMiddleware (via request.state.request_id) -- reusing
+the existing correlation ID rather than generating a second one.
+
+Headers: standard X-RateLimit-Limit / X-RateLimit-Remaining /
+X-RateLimit-Reset headers are set on EVERY genuinely-new request's
+response (allowed or rejected), plus Retry-After specifically on the
+429 response.
+
+Rejected-request guarantee: because this check happens before token
+counting, budget reservation, idempotency acquisition, or any provider
+call, a 429 (or a 503 from a failed-closed unavailable check) is
+guaranteed to have caused none of: an OpenAI call, a budget reservation,
+a new idempotency row, or a usage record -- a structural property of the
+code's ordering, not a separately enforced check.
 """
 
 import asyncio
@@ -136,6 +145,7 @@ from app.services.pricing import (
     calculate_cost_for_pricing,
     get_model_pricing,
 )
+from app.services.rate_limit import RateLimiter, RateLimitResult, RateLimitUnavailableError
 from app.services.routing import (
     AllCandidatesFailedError,
     FailureCategory,
@@ -211,6 +221,24 @@ def get_session_factory(request: Request) -> Callable[[], Session]:
     return getattr(request.app.state, "session_factory", SessionLocal)
 
 
+def get_rate_limiter(request: Request) -> RateLimiter:
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if limiter is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "rate_limiter_not_configured", "message": "rate limiting is not configured"},
+        )
+    return limiter
+
+
+def get_rate_limit_max_requests(request: Request) -> int:
+    return getattr(request.app.state, "rate_limit_max_requests", 60)
+
+
+def get_rate_limit_window_seconds(request: Request) -> int:
+    return getattr(request.app.state, "rate_limit_window_seconds", 60)
+
+
 def _default_model_for_registry(registry: Mapping[str, ProviderRegistration]) -> str:
     registration = registry.get("openai")
     if registration is None or not registration.supported_models:
@@ -221,7 +249,13 @@ def _default_model_for_registry(registry: Mapping[str, ProviderRegistration]) ->
     return next(iter(registration.supported_models))
 
 
-# --- Synchronous helpers, always invoked via asyncio.to_thread ---------
+def _set_rate_limit_headers(response: Response, result: RateLimitResult) -> None:
+    response.headers["X-RateLimit-Limit"] = str(result.limit)
+    response.headers["X-RateLimit-Remaining"] = str(result.remaining)
+    response.headers["X-RateLimit-Reset"] = str(int(result.reset_at))
+
+
+# --- Synchronous (Postgres) helpers, always invoked via asyncio.to_thread ---
 
 def _authenticate_sync(session_factory: Callable[[], Session], authorization: str | None):
     session = session_factory()
@@ -460,9 +494,7 @@ async def _settle_and_resolve(
     settlement call itself raises, converts that to
     _unresolved_settlement_error (never claims a refund occurred that
     did not commit). Does NOT yet inspect `claimed` -- see
-    _resolve_authoritative_state_if_not_claimed for that, called
-    separately by the caller once it knows what response to build on
-    top of a `claimed=True` vs `claimed=False` result.
+    _resolve_authoritative_state_if_not_claimed for that.
     """
     fn = _settle_success_sync if success else _settle_failure_sync
     try:
@@ -491,9 +523,7 @@ async def _resolve_authoritative_state_if_not_claimed(
 ) -> "ChatCompletionResponseBody | None":
     """If settle_result.claimed is True, returns None (caller proceeds
     normally). If False, fetches and returns/raises the authoritative
-    stored state instead of trusting any locally-computed narrative --
-    used identically whether the settlement attempt was a success or a
-    failure path.
+    stored state instead of trusting any locally-computed narrative.
     """
     if settle_result.claimed:
         return None
@@ -518,6 +548,7 @@ async def _resolve_authoritative_state_if_not_claimed(
     status_code=status.HTTP_200_OK,
 )
 async def create_chat_completion(
+    request: Request,
     body: ChatCompletionRequest,
     response: Response,
     authorization: str | None = Header(default=None),
@@ -526,6 +557,9 @@ async def create_chat_completion(
     retry_policy: RetryPolicy = Depends(get_retry_policy),
     timeout_ms: int = Depends(get_timeout_ms),
     session_factory: Callable[[], Session] = Depends(get_session_factory),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
+    rate_limit_max_requests: int = Depends(get_rate_limit_max_requests),
+    rate_limit_window_seconds: int = Depends(get_rate_limit_window_seconds),
 ) -> ChatCompletionResponseBody:
     # --- 1. Structural request validation -- applies to every request,
     #        replay or new, since it is about well-formedness, not
@@ -568,9 +602,7 @@ async def create_chat_completion(
     team_id = auth.team.id
     logger.info("authenticated", extra={"team_id": str(team_id)})
 
-    # --- 3. Fingerprint from EXACTLY what the client sent (body.model,
-    #        which may be None) -- never the server-resolved default, so
-    #        replay stays stable even if the default model changes. ---
+    # --- 3. Fingerprint from EXACTLY what the client sent. ---
     try:
         request_hash = compute_request_fingerprint(
             {"model": body.model, "prompt": body.prompt, "max_tokens": body.max_tokens}
@@ -583,7 +615,7 @@ async def create_chat_completion(
 
     # --- 4. REPLAY RESOLUTION FIRST -- before any "new request only"
     #        requirement (unknown-model check, budget period, token
-    #        counting) is ever evaluated. ---
+    #        counting, rate limiting) is ever evaluated. ---
     existing = await asyncio.to_thread(
         _resolve_existing_row_sync, session_factory, team_id, idempotency_key, request_hash
     )
@@ -599,7 +631,59 @@ async def create_chat_completion(
         raise existing.error
     # existing.kind == "none" -- genuinely new request. Continue below.
 
-    # --- 5. Requirements that apply ONLY to a genuinely new request. ---
+    # --- 5. Rate limiting (Redis, atomic sliding-window Lua script) --
+    #        the cheapest "new request only" check, checked first among
+    #        them, so a rejected or fail-closed request never reaches
+    #        unknown-model validation, token counting, budget
+    #        reservation, idempotency acquisition, or any provider call. ---
+    request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
+    try:
+        rate_result = await rate_limiter.check(
+            team_id=str(team_id),
+            window_seconds=rate_limit_window_seconds,
+            limit=rate_limit_max_requests,
+            member=request_id,
+        )
+    except RateLimitUnavailableError:
+        # Fail CLOSED: Redis being unreachable must never be treated as
+        # license to allow unlimited requests through -- see
+        # app.services.rate_limit's module docstring.
+        logger.error("rate_limiter_unavailable", extra={"team_id": str(team_id)})
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "rate_limiter_unavailable",
+                "message": "rate limiting is temporarily unavailable; try again shortly",
+            },
+        ) from None
+
+    if not rate_result.allowed:
+        logger.warning(
+            "rate_limited",
+            extra={
+                "team_id": str(team_id),
+                "limit": rate_result.limit,
+                "current_count": rate_result.current_count,
+                "window_seconds": rate_limit_window_seconds,
+            },
+        )
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "code": "rate_limited",
+                "message": "too many requests for this team; slow down and retry after the window resets",
+            },
+            headers={
+                "Retry-After": str(rate_result.retry_after_seconds),
+                "X-RateLimit-Limit": str(rate_result.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(int(rate_result.reset_at)),
+            },
+        )
+    _set_rate_limit_headers(response, rate_result)
+
+    # --- 6. Requirements that apply ONLY to a genuinely new request,
+    #        beyond rate limiting. ---
     model = body.model or _default_model_for_registry(registry)
 
     try:
@@ -621,7 +705,7 @@ async def create_chat_completion(
             detail={"code": "unknown_model", "message": "requested model is not supported by this deployment"},
         ) from None
 
-    # --- 6. Authoritative token count, with its own explicit timeout
+    # --- 7. Authoritative token count, with its own explicit timeout
     #        and safe error handling. Cancellation is never caught. ---
     adapter = registry["openai"].adapter
     count_fn = getattr(adapter, "count_input_tokens", None)
@@ -712,11 +796,6 @@ async def create_chat_completion(
         if replay is not None:
             response.headers["Idempotent-Replayed"] = "true"
             return replay
-        # settle_result.claimed is True: our own accounting state IS
-        # confirmed resolved (the reservation was released), even though
-        # OpenAI's true billing for the exhausted attempts could not be
-        # confirmed -- see module docstring for why these are different
-        # things. The team was not charged for this request.
         if last_category in (FailureCategory.RETRYABLE_PROVIDER_ERROR, FailureCategory.TIMEOUT):
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -737,8 +816,6 @@ async def create_chat_completion(
             },
         ) from None
     except asyncio.CancelledError:
-        # Preserve cancellation exactly. The reservation is deliberately
-        # left untouched: we do not know OpenAI's billing outcome.
         logger.info(
             "request_cancelled",
             extra={"team_id": str(team_id), "idempotency_key_id": str(idempotency_key_id)},
@@ -784,9 +861,6 @@ async def create_chat_completion(
             "openai", model, route_result.result.prompt_tokens, route_result.result.completion_tokens
         )
     except Exception:
-        # Genuinely last-resort: even the known, real token counts could
-        # not be priced. actual_cost is not knowable here; distinctly
-        # labeled from every other failure code.
         logger.exception(
             "cost_calculation_failed",
             extra={"team_id": str(team_id), "idempotency_key_id": str(idempotency_key_id)},
@@ -820,9 +894,6 @@ async def create_chat_completion(
             status="succeeded",
         )
     except Exception:
-        # A real completion was produced and actual_cost IS known (computed
-        # above) -- settle with the REAL cost, never zero, even though the
-        # response body itself could not be constructed.
         logger.exception(
             "response_construction_failed",
             extra={"team_id": str(team_id), "idempotency_key_id": str(idempotency_key_id)},

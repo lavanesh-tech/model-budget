@@ -15,5 +15,25 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    # Local stand-in for AWS ElastiCache for Redis. Holds ONLY ephemeral
+    # rate-limit counters (see app/services/rate_limit.py) -- Postgres
+    # (above) remains the durable system of record for everything else.
+    # The named volume below is not functionally required for
+    # correctness (rate-limit keys carry their own short TTLs) -- it's
+    # included only for local-dev convenience/consistency with the
+    # Postgres service above.
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   pgdata:
+  redisdata:

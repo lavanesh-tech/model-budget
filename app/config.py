@@ -41,6 +41,24 @@ class Settings(BaseSettings):
     # Must be a real Python logging level name.
     log_level: str = "INFO"
 
+    # Step 32 (Redis redesign): connection URL for the rate-limit Redis
+    # instance (local Docker Compose by default; AWS ElastiCache for
+    # Redis in production -- possibly with an embedded AUTH token or a
+    # rediss:// TLS scheme, which is exactly why this is a SecretStr,
+    # never logged or exposed in an error message anywhere in this
+    # codebase). Postgres remains the durable system of record for
+    # teams/budgets/idempotency/usage; Redis holds ONLY ephemeral
+    # rate-limit counters.
+    redis_url: SecretStr = SecretStr("redis://127.0.0.1:6379/0")
+    redis_socket_timeout_seconds: float = 2.0
+    redis_socket_connect_timeout_seconds: float = 2.0
+
+    # A single global default limit per team, per sliding window (see
+    # app.services.rate_limit). Per-team overrides are real future work,
+    # deliberately not added in this step.
+    rate_limit_max_requests: int = 60
+    rate_limit_window_seconds: int = 60
+
     @field_validator("openai_api_key")
     @classmethod
     def _openai_api_key_not_blank(cls, value: SecretStr | None) -> SecretStr | None:
@@ -80,6 +98,31 @@ class Settings(BaseSettings):
                 f"log_level must be a real logging level name (e.g. DEBUG, INFO, WARNING, ERROR), got {value!r}"
             )
         return candidate
+
+    @field_validator("redis_url")
+    @classmethod
+    def _redis_url_not_blank(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("redis_url must not be blank")
+        return value
+
+    @field_validator("redis_socket_timeout_seconds", "redis_socket_connect_timeout_seconds")
+    @classmethod
+    def _redis_timeout_positive(cls, value: float) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"value must be a plain number, got {type(value).__name__}")
+        if value <= 0:
+            raise ValueError("value must be > 0")
+        return float(value)
+
+    @field_validator("rate_limit_max_requests", "rate_limit_window_seconds")
+    @classmethod
+    def _rate_limit_field_positive(cls, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"value must be a plain int, got {type(value).__name__}")
+        if value < 1:
+            raise ValueError("value must be >= 1")
+        return value
 
 
 @lru_cache

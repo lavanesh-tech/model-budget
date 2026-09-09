@@ -12,6 +12,7 @@ dependencies = [
     "alembic>=1.13",
     "argon2-cffi>=23.1",
     "openai>=2.0.0",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]

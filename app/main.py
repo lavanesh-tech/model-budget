@@ -3,6 +3,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
+import redis.asyncio as redis_asyncio
 from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -13,6 +14,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.logging_config import configure_logging, new_request_id, set_request_id
 from app.providers.openai import build_production_provider_registry
+from app.services.rate_limit import RedisRateLimiter
 from app.services.routing import RetryPolicy
 
 _DEFAULT_PROVIDER_TIMEOUT_MS = 30_000
@@ -28,10 +30,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     app.logging_config) so every log line emitted while handling this
     request -- including from the synchronous helpers run via
     asyncio.to_thread -- is automatically stamped with it, without any
-    application code needing to pass it explicitly. The same ID is
-    echoed back as X-Request-ID on the response, including on error
-    responses, since that is exactly when someone needs to search logs
-    for it.
+    application code needing to pass it explicitly. As of Step 32, this
+    same ID is also reused as the Redis sorted-set member for the rate
+    limiter (see app.services.rate_limit and app.api.chat_completions) --
+    one correlation ID serves both purposes, deliberately, rather than
+    inventing a second one. The ID is echoed back as X-Request-ID on the
+    response, including on error responses.
     """
 
     async def dispatch(
@@ -88,6 +92,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.provider_registry = None
     app.state.owned_openai_provider = None
 
+    # Step 32: Redis-backed rate limiting. Postgres remains the durable
+    # system of record for everything else; Redis holds ONLY ephemeral
+    # rate-limit counters (see app.services.rate_limit's module
+    # docstring). redis.asyncio.Redis.from_url(...) is lazy -- it parses
+    # the URL and builds a connection pool but makes NO network call
+    # here, mirroring how OpenAIProvider.from_settings already works
+    # below. The connection URL itself (which may embed an AWS
+    # ElastiCache AUTH token) is read via get_secret_value() exactly
+    # once, right here, and never logged.
+    redis_client = redis_asyncio.Redis.from_url(
+        settings.redis_url.get_secret_value(),
+        socket_timeout=settings.redis_socket_timeout_seconds,
+        socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+        decode_responses=False,
+    )
+    app.state.redis_client = redis_client
+    app.state.rate_limiter = RedisRateLimiter(redis_client)
+    app.state.rate_limit_max_requests = settings.rate_limit_max_requests
+    app.state.rate_limit_window_seconds = settings.rate_limit_window_seconds
+    logger.info(
+        "rate_limiter_configured",
+        extra={
+            "limit": settings.rate_limit_max_requests,
+            "window_seconds": settings.rate_limit_window_seconds,
+        },
+    )
+
     # Production only ever uses the real OpenAIProvider, never
     # MockProvider. If OPENAI_API_KEY is not configured, the registry
     # stays None and every /v1/chat/completions request cleanly returns
@@ -125,6 +156,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             if callable(aclose):
                 await aclose()
                 logger.info("provider_client_closed")
+
+        redis_client_to_close = app.state.redis_client
+        if redis_client_to_close is not None:
+            await redis_client_to_close.aclose()
+            logger.info("redis_client_closed")
 
 
 async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
