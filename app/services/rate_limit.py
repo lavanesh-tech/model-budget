@@ -63,14 +63,17 @@ local count = redis.call('ZCARD', key)
 if count < limit then
     redis.call('ZADD', key, now, member)
     redis.call('PEXPIRE', key, (window_seconds + 1) * 1000)
-    return {1, count + 1, limit, 0}
+    local reset_at = now + window_seconds
+    return {1, count + 1, limit, tostring(reset_at), 0}
 else
     local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
     local oldest_score = now
     if #oldest > 0 then
         oldest_score = tonumber(oldest[2])
     end
-    return {0, count, limit, oldest_score}
+    local reset_at = oldest_score + window_seconds
+    local retry_after_seconds = math.max(math.ceil(reset_at - now), 0)
+    return {0, count, limit, tostring(reset_at), retry_after_seconds}
 end
 """
 
@@ -92,15 +95,12 @@ class RateLimitResult:
     limit: int
     current_count: int
     window_seconds: int
-    reset_at: float  # unix timestamp (float seconds)
+    reset_at: float  # Unix timestamp supplied by Redis.
+    retry_after_seconds: int = 0  # Never derived from the app machine clock.
 
     @property
     def remaining(self) -> int:
         return max(self.limit - self.current_count, 0)
-
-    @property
-    def retry_after_seconds(self) -> int:
-        return max(int(self.reset_at - time.time()), 0)
 
 
 class RateLimiter(Protocol):
@@ -140,17 +140,24 @@ class RedisRateLimiter:
         # asyncio.CancelledError and any exception type not a RedisError
         # subclass is intentionally NOT caught above -- it propagates.
 
-        allowed_flag, current_count, returned_limit, oldest_score = raw
+        (
+            allowed_flag,
+            current_count,
+            returned_limit,
+            reset_at,
+            retry_after_seconds,
+        ) = raw
         allowed = bool(int(allowed_flag))
         current_count = int(current_count)
         returned_limit = int(returned_limit)
-        oldest_score = float(oldest_score)
+        reset_at = float(reset_at)
+        retry_after_seconds = max(int(retry_after_seconds), 0)
 
-        reset_at = oldest_score + window_seconds if not allowed else time.time() + window_seconds
         return RateLimitResult(
             allowed=allowed,
             limit=returned_limit,
             current_count=current_count,
             window_seconds=window_seconds,
             reset_at=reset_at,
+            retry_after_seconds=retry_after_seconds,
         )
