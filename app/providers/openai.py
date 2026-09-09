@@ -46,6 +46,15 @@ receive" without describing it as a billable generation; this
 implementation does not assume it is free of any charge, and this
 assumption should be reconfirmed against OpenAI's current pricing page
 before high-volume production use.
+
+Step 34 addition -- circuit breaker wiring: build_production_provider_
+registry now optionally accepts a circuit_breaker_config
+(app.services.routing.CircuitBreakerConfig). When provided, a fresh
+CircuitBreaker is constructed and attached to the single "openai"
+ProviderRegistration -- see app.services.routing's own module docstring
+for the full circuit-breaker design (per-process, in-memory, not
+Redis-shared). When omitted (None), the registry behaves exactly as
+before Step 34: no circuit breaking.
 """
 
 import time
@@ -58,6 +67,8 @@ from openai import AsyncOpenAI
 
 from app.providers.base import CompletionRequest, CompletionResult, ProviderError
 from app.services.routing import (
+    CircuitBreaker,
+    CircuitBreakerConfig,
     NonRetryableProviderError,
     ProviderRegistration,
     RetryableProviderError,
@@ -237,6 +248,7 @@ def build_production_provider_registry(
     base_url: str | None = None,
     organization: str | None = None,
     project: str | None = None,
+    circuit_breaker_config: CircuitBreakerConfig | None = None,
 ) -> Mapping[str, ProviderRegistration]:
     if not isinstance(model, str) or not model.strip():
         raise ValueError("OpenAI model must not be blank")
@@ -246,5 +258,8 @@ def build_production_provider_registry(
     provider = OpenAIProvider.from_settings(
         api_key=api_key, base_url=base_url, organization=organization, project=project
     )
-    registration = ProviderRegistration("openai", provider, OpenAIProvider.supported_models)
+    circuit_breaker = CircuitBreaker(circuit_breaker_config) if circuit_breaker_config is not None else None
+    registration = ProviderRegistration(
+        "openai", provider, OpenAIProvider.supported_models, circuit_breaker=circuit_breaker
+    )
     return build_provider_registry((registration,))

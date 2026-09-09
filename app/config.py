@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     rate_limit_max_requests: int = 60
     rate_limit_window_seconds: int = 60
 
+    # Step 34: circuit breaker for the "openai" provider (see
+    # app.services.routing.CircuitBreaker). Per-process, in-memory only
+    # -- see that class's own docstring for why this is not Redis-shared
+    # like the rate limiter. After this many CONSECUTIVE failed attempts
+    # against the candidate in a row (across requests), the circuit
+    # opens and further requests fail fast for cooldown_seconds before a
+    # single trial request is allowed through.
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_cooldown_seconds: float = 30.0
+
     @field_validator("openai_api_key")
     @classmethod
     def _openai_api_key_not_blank(cls, value: SecretStr | None) -> SecretStr | None:
@@ -123,6 +133,24 @@ class Settings(BaseSettings):
         if value < 1:
             raise ValueError("value must be >= 1")
         return value
+
+    @field_validator("circuit_breaker_failure_threshold")
+    @classmethod
+    def _circuit_breaker_failure_threshold_in_range(cls, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"circuit_breaker_failure_threshold must be a plain int, got {type(value).__name__}")
+        if value < 1 or value > 100:
+            raise ValueError("circuit_breaker_failure_threshold must be between 1 and 100")
+        return value
+
+    @field_validator("circuit_breaker_cooldown_seconds")
+    @classmethod
+    def _circuit_breaker_cooldown_seconds_in_range(cls, value: float) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"circuit_breaker_cooldown_seconds must be a plain number, got {type(value).__name__}")
+        if not (0.001 <= value <= 3600.0):
+            raise ValueError("circuit_breaker_cooldown_seconds must be between 0.001 and 3600.0")
+        return float(value)
 
 
 @lru_cache

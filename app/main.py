@@ -17,7 +17,7 @@ from app.logging_config import configure_logging, new_request_id, set_request_id
 from app.metrics import http_request_duration_seconds, http_requests_total
 from app.providers.openai import build_production_provider_registry
 from app.services.rate_limit import RedisRateLimiter
-from app.services.routing import RetryPolicy
+from app.services.routing import CircuitBreakerConfig, RetryPolicy
 
 _DEFAULT_PROVIDER_TIMEOUT_MS = 30_000
 
@@ -151,6 +151,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # stays None and every /v1/chat/completions request cleanly returns
     # 503 "no_provider_configured" -- never a silent fallback to a free
     # mock model. Constructing the client performs NO network call.
+    # Step 34: a per-process CircuitBreaker is attached to the "openai"
+    # registration -- see app.services.routing.CircuitBreaker's own
+    # docstring for the full design.
     if settings.openai_api_key is not None:
         registry = build_production_provider_registry(
             api_key=settings.openai_api_key.get_secret_value(),
@@ -158,6 +161,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             base_url=settings.openai_base_url,
             organization=settings.openai_organization,
             project=settings.openai_project,
+            circuit_breaker_config=CircuitBreakerConfig(
+                failure_threshold=settings.circuit_breaker_failure_threshold,
+                cooldown_seconds=settings.circuit_breaker_cooldown_seconds,
+            ),
         )
         app.state.provider_registry = registry
         # owned_openai_provider is set ONLY here, in the one branch where
@@ -165,7 +172,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # via app.dependency_overrides (every test) never touches
         # app.state at all, so it can never end up here.
         app.state.owned_openai_provider = registry["openai"].adapter
-        logger.info("provider_configured", extra={"provider": "openai", "model": settings.openai_model})
+        logger.info(
+            "provider_configured",
+            extra={
+                "provider": "openai",
+                "model": settings.openai_model,
+                "circuit_breaker_failure_threshold": settings.circuit_breaker_failure_threshold,
+                "circuit_breaker_cooldown_seconds": settings.circuit_breaker_cooldown_seconds,
+            },
+        )
     else:
         logger.warning("provider_not_configured", extra={"reason": "OPENAI_API_KEY not set"})
 

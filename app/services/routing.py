@@ -1,11 +1,13 @@
 """
 Provider routing: candidate registry, ordered fallback routing, per-attempt
-timeouts, and a retry/backoff policy.
+timeouts, a retry/backoff policy, and (Step 34) an optional per-provider
+circuit breaker.
 
 Transaction boundary: this module has NO database dependency. It never
 imports app.db, app.models, or any DB-touching service, and never creates,
 holds, commits, or closes a Session. Nothing here can open a database
-connection.
+connection. The circuit breaker added in Step 34 is pure in-memory state
+-- no I/O -- so it does not violate this principle.
 
 Failure classification: adapters should raise RetryableProviderError or
 NonRetryableProviderError (both subclass the existing app.providers.base
@@ -15,7 +17,10 @@ fail-safe for adapters that haven't been updated to signal retryability
 explicitly. A ProviderContractError (an adapter returning a malformed
 CompletionResult) is treated as a programming/implementation bug, not a
 provider failure: it propagates immediately, unretried, with no fallback,
-exactly like an entirely unexpected exception type would. asyncio.
+exactly like an entirely unexpected exception type would -- and, since it
+propagates before this module's circuit-breaker bookkeeping runs, it never
+counts as a circuit-breaker failure either (a contract violation says
+nothing about whether the provider itself is healthy). asyncio.
 CancelledError, KeyboardInterrupt, SystemExit, and GeneratorExit are all
 BaseException subclasses (not Exception subclasses), so no except clause
 here ever catches them -- they always propagate.
@@ -48,6 +53,28 @@ that every route candidate has BOTH a registered adapter (checked here)
 AND a pricing catalog entry (checked separately by the caller against
 Step 25's catalog) before dispatching a request -- these two checks are
 deliberately independent and composed elsewhere, not coupled here.
+
+--- Step 34 addition: circuit breaker ---
+
+Per-process, in-memory only -- deliberately NOT shared across multiple
+FastAPI instances via Redis, unlike app.services.rate_limit's rate
+limiter. See CircuitBreaker's own docstring below for the full rationale
+on why that is the correct tradeoff for a circuit breaker specifically
+(its entire purpose is failing fast; adding network coordination would
+undermine that and introduce a new failure mode).
+
+Granularity: checked once per candidate, before that candidate's retry
+loop begins for THIS request, and updated once after that loop
+concludes (based on whether ANY attempt against this candidate in this
+request succeeded). It does not abort a request's own retry loop
+mid-way because of that same request's failures -- it protects FUTURE
+requests from a candidate already observed to be unhealthy across PRIOR
+requests.
+
+Integration: attached as an OPTIONAL field on ProviderRegistration
+(default None -- fully opt-in). execute_route's public signature is
+completely unchanged; every existing caller/test registry that does not
+pass a circuit_breaker keeps working exactly as before.
 """
 
 import asyncio
@@ -63,6 +90,10 @@ from app.providers.base import CompletionRequest, CompletionResult, ProviderAdap
 _MAX_ATTEMPTS_PER_CANDIDATE_CAP = 10
 _MAX_CANDIDATES_CAP = 10
 _MAX_BACKOFF_MS_CAP = 60_000  # 60 seconds
+_MIN_FAILURE_THRESHOLD = 1
+_MAX_FAILURE_THRESHOLD = 100
+_MIN_COOLDOWN_SECONDS = 0.001
+_MAX_COOLDOWN_SECONDS = 3600.0
 
 
 class RoutingError(Exception):
@@ -204,11 +235,112 @@ def compute_backoff_ms(policy: RetryPolicy, attempt_number: int) -> int:
     return capped
 
 
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class SkipReason(Enum):
+    CIRCUIT_OPEN = "circuit_open"
+
+
+@dataclass(frozen=True)
+class CircuitBreakerConfig:
+    failure_threshold: int
+    cooldown_seconds: float
+
+    def __post_init__(self) -> None:
+        _validate_int_range(
+            "failure_threshold", self.failure_threshold,
+            minimum=_MIN_FAILURE_THRESHOLD, maximum=_MAX_FAILURE_THRESHOLD,
+        )
+        if isinstance(self.cooldown_seconds, bool) or not isinstance(self.cooldown_seconds, (int, float)):
+            raise RoutingValidationError(
+                f"cooldown_seconds must be a plain number, got {type(self.cooldown_seconds).__name__}"
+            )
+        if not (_MIN_COOLDOWN_SECONDS <= self.cooldown_seconds <= _MAX_COOLDOWN_SECONDS):
+            raise RoutingValidationError(
+                f"cooldown_seconds must be between {_MIN_COOLDOWN_SECONDS} and {_MAX_COOLDOWN_SECONDS}"
+            )
+
+
+class CircuitBreaker:
+    """
+    Per-process, in-memory circuit breaker for one provider. Deliberately
+    NOT shared across multiple FastAPI instances via Redis (unlike
+    app.services.rate_limit's rate limiter, which genuinely needs shared
+    state for correctness) -- see the module docstring's "Step 34
+    addition" section for the full rationale.
+
+    State machine: CLOSED -- (>= failure_threshold consecutive failures)
+    --> OPEN -- (cooldown_seconds elapsed) --> HALF_OPEN (exactly one
+    trial request allowed through) --> CLOSED (trial succeeded) or OPEN
+    (trial failed, fresh cooldown).
+
+    Thread-safety note: should_allow()/record_success()/record_failure()
+    contain no `await` and perform no I/O, so under Python's
+    single-threaded, cooperatively-scheduled asyncio event loop, no
+    other coroutine can interleave between a state read here and its
+    corresponding mutation -- these methods are therefore safe without an
+    explicit lock, PROVIDED they are only ever called from code running
+    directly on the event loop (true throughout this project:
+    execute_route is always awaited directly, never wrapped in
+    asyncio.to_thread). This would NOT be safe under true OS-thread
+    concurrency, which this project does not use for this code path.
+    """
+
+    def __init__(self, config: CircuitBreakerConfig) -> None:
+        if not isinstance(config, CircuitBreakerConfig):
+            raise RoutingValidationError(f"config must be a CircuitBreakerConfig, got {type(config).__name__}")
+        self._config = config
+        self._state = CircuitState.CLOSED
+        self._consecutive_failures = 0
+        self._opened_at: float | None = None
+
+    @property
+    def state(self) -> CircuitState:
+        return self._state
+
+    def should_allow(self) -> bool:
+        """Returns whether a new candidate attempt may proceed right now.
+        If the circuit is OPEN and the cooldown has elapsed, this call
+        ITSELF transitions the breaker to HALF_OPEN and claims the single
+        trial slot (returns True); any other call made before that trial
+        resolves sees HALF_OPEN and returns False.
+        """
+        now = time.monotonic()
+        if self._state == CircuitState.CLOSED:
+            return True
+        if self._state == CircuitState.OPEN:
+            if self._opened_at is not None and (now - self._opened_at) >= self._config.cooldown_seconds:
+                self._state = CircuitState.HALF_OPEN
+                return True
+            return False
+        return False  # HALF_OPEN: a trial is already in flight
+
+    def record_success(self) -> None:
+        self._state = CircuitState.CLOSED
+        self._consecutive_failures = 0
+        self._opened_at = None
+
+    def record_failure(self) -> None:
+        if self._state == CircuitState.HALF_OPEN:
+            self._state = CircuitState.OPEN
+            self._opened_at = time.monotonic()
+            return
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._config.failure_threshold:
+            self._state = CircuitState.OPEN
+            self._opened_at = time.monotonic()
+
+
 @dataclass(frozen=True)
 class ProviderRegistration:
     name: str
     adapter: ProviderAdapter
     supported_models: frozenset[str]
+    circuit_breaker: CircuitBreaker | None = None
 
     def __post_init__(self) -> None:
         _validate_identifier("name", self.name)
@@ -228,6 +360,11 @@ class ProviderRegistration:
             raise RoutingValidationError("supported_models must be a non-empty frozenset of model names")
         for model in self.supported_models:
             _validate_identifier("supported_models entry", model)
+
+        if self.circuit_breaker is not None and not isinstance(self.circuit_breaker, CircuitBreaker):
+            raise RoutingValidationError(
+                f"circuit_breaker must be a CircuitBreaker or None, got {type(self.circuit_breaker).__name__}"
+            )
 
 
 def build_provider_registry(
@@ -316,6 +453,7 @@ def validate_route_against_registry(registry: Mapping[str, ProviderRegistration]
 class AttemptOutcome(Enum):
     SUCCESS = "success"
     FAILURE = "failure"
+    SKIPPED = "skipped"  # no request was ever sent -- e.g. circuit breaker open
 
 
 class FailureCategory(Enum):
@@ -329,6 +467,10 @@ class AttemptRecord:
     """Safe operational metadata only -- deliberately holds no prompt,
     completion, or secret material, so it never needs redaction anywhere
     it's logged, repr'd, or attached to AllCandidatesFailedError.
+
+    attempt_number is 0 for a SKIPPED record (no real attempt occurred,
+    so there is no meaningful ordinal); it is 1-indexed for every real
+    attempt, as before Step 34.
     """
     provider: str
     model: str
@@ -336,6 +478,7 @@ class AttemptRecord:
     outcome: AttemptOutcome
     failure_category: FailureCategory | None
     elapsed_ms: int
+    skip_reason: SkipReason | None = None
 
 
 @dataclass(frozen=True)
@@ -348,6 +491,23 @@ class RouteResult:
     result: CompletionResult
     total_latency_ms: int
     attempts: tuple[AttemptRecord, ...]
+
+
+def is_transient_failure(attempts: tuple[AttemptRecord, ...]) -> bool:
+    """True if the route's LAST recorded attempt indicates a transient
+    condition worth inviting a retry for -- a timeout, a retryable
+    provider error, or the circuit breaker being open -- as opposed to a
+    definitive rejection (a non-retryable provider error). Used by
+    callers (see app.api.chat_completions) to choose between a 503 "try
+    again later" and a 502 "this request failed" response after
+    AllCandidatesFailedError.
+    """
+    if not attempts:
+        return False
+    last = attempts[-1]
+    if last.outcome == AttemptOutcome.SKIPPED:
+        return True
+    return last.failure_category in (FailureCategory.TIMEOUT, FailureCategory.RETRYABLE_PROVIDER_ERROR)
 
 
 def _validate_nonneg_plain_int(label: str, value) -> None:
@@ -429,7 +589,9 @@ async def _run_candidate(
             # clause above (exceptions from an `else` block are not
             # caught by that same try's except clauses) -- it propagates
             # immediately out of _run_candidate and execute_route,
-            # exactly once, with no retry and no fallback.
+            # exactly once, with no retry and no fallback, and (see
+            # module docstring) never reaches the circuit breaker's
+            # bookkeeping either.
             _validate_completion_result(candidate, result)
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             attempts.append(
@@ -476,9 +638,17 @@ async def execute_route(
 ) -> RouteResult:
     """Execute a route: try each candidate in order, applying retry_policy
     and a per-attempt timeout_ms to each. Returns on the first success.
-    Raises AllCandidatesFailedError if every candidate is exhausted. All
+    Raises AllCandidatesFailedError if every candidate is exhausted (or
+    skipped due to an open circuit breaker -- see module docstring). All
     inputs are fully validated (structurally, then against the registry)
     before any provider is ever called.
+
+    Step 34: before attempting a candidate, its registration's
+    circuit_breaker (if any) is consulted via should_allow(). If it
+    refuses, a SKIPPED AttemptRecord is appended (no adapter call is
+    made) and routing moves to the next candidate. After a genuinely
+    attempted candidate's retry loop concludes, the breaker (if any) is
+    updated exactly once via record_success()/record_failure().
     """
     _validate_execute_route_inputs(registry, route, retry_policy, prompt, max_tokens, timeout_ms, sleep_fn)
     validate_route_against_registry(registry, route)
@@ -489,9 +659,27 @@ async def execute_route(
 
     for candidate_index, candidate in enumerate(route.candidates):
         registration = registry[candidate.provider]
+        breaker = registration.circuit_breaker
+
+        if breaker is not None and not breaker.should_allow():
+            attempts.append(
+                AttemptRecord(
+                    candidate.provider, candidate.model, 0,
+                    AttemptOutcome.SKIPPED, None, 0, SkipReason.CIRCUIT_OPEN,
+                )
+            )
+            continue
+
         result = await _run_candidate(
             registration, candidate, prompt, max_tokens, retry_policy, timeout_seconds, sleep_fn, attempts
         )
+
+        if breaker is not None:
+            if result is not None:
+                breaker.record_success()
+            else:
+                breaker.record_failure()
+
         if result is not None:
             total_latency_ms = int((time.perf_counter() - route_start) * 1000)
             primary = route.candidates[0]

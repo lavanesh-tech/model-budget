@@ -1,6 +1,6 @@
 """
 POST /v1/chat/completions -- the complete authenticated inference
-workflow. This is the sixth revision; see the corrections/additions
+workflow. This is the seventh revision; see the corrections/additions
 below (earlier revision notes are preserved for history).
 
 --- Step 30 v3 corrections ---
@@ -39,7 +39,11 @@ claimed=False inspected on EVERY settlement call, not only the success
 path.
 
 Uncertain upstream cost, honestly labeled: an exhausted-retries failure
-never implies a "confirmed" zero cost.
+never implies a "confirmed" zero cost -- UNLESS (Step 34) every single
+attempt was skipped because the circuit breaker was open, in which case
+zero cost genuinely IS confirmed (no request was ever sent). See the
+AllCandidatesFailedError handling below for exactly how these two cases
+are now distinguished.
 
 settlement_unresolved vs. confirmed failure: distinguished explicitly --
 a settlement attempt that itself fails to commit is never reported to
@@ -96,6 +100,29 @@ never a financial record (PostgreSQL usage_records remains that).
 Nothing added here performs any I/O, and no label anywhere in this file
 carries team_id, idempotency_key_id, a prompt, or any other unbounded
 value.
+
+--- Step 34 addition: circuit breaker integration ---
+
+app.services.routing.execute_route now transparently skips a candidate
+whose (optional, per-process, in-memory) circuit breaker is open,
+recording a SKIPPED AttemptRecord instead of ever calling the adapter --
+see that module's own docstring for the full breaker design. This
+endpoint does not need to know anything about circuit-breaker mechanics
+directly: it uses the new app.services.routing.is_transient_failure(...)
+helper to decide 503 ("try again later") vs 502 ("this failed") after
+AllCandidatesFailedError, which now correctly treats a circuit-open skip
+the same way it treats a timeout or retryable provider error -- both are
+transient, worth inviting a retry for.
+
+One genuine accuracy improvement this unlocks: when EVERY attempt for
+every candidate was skipped (the circuit was already open before this
+request even started, so literally no request was ever sent to
+OpenAI), the settled error_code is CIRCUIT_OPEN_NO_ATTEMPT and the
+client-facing message says cost is CONFIRMED zero -- not merely
+"could not be confirmed" (RETRIES_EXHAUSTED_COST_UNKNOWN), which
+remains reserved for the case where at least one real attempt was made
+and failed, and OpenAI's billing for that real attempt genuinely cannot
+be known from here.
 """
 
 import asyncio
@@ -135,7 +162,7 @@ from app.services.pricing import (
 from app.services.rate_limit import RateLimiter, RateLimitResult, RateLimitUnavailableError
 from app.services.routing import (
     AllCandidatesFailedError,
-    FailureCategory,
+    AttemptOutcome,
     NonRetryableProviderError,
     ProviderRegistration,
     RetryableProviderError,
@@ -144,6 +171,7 @@ from app.services.routing import (
     RoutingValidationError,
     build_route,
     execute_route,
+    is_transient_failure,
     validate_route_against_registry,
 )
 from app.services.settlement import SettlementResult, settle_failure, settle_success
@@ -782,19 +810,30 @@ async def create_chat_completion(
     try:
         route_result = await execute_route(registry, route, body.prompt, body.max_tokens, retry_policy, timeout_ms)
     except AllCandidatesFailedError as exc:
-        last_category = exc.attempts[-1].failure_category if exc.attempts else None
+        # Step 34: a circuit-open skip and a real (timeout/retryable)
+        # failure are both "transient" from the client's perspective --
+        # is_transient_failure() classifies either as worth a retry
+        # (503) versus a definitive rejection (502).
+        all_skipped = bool(exc.attempts) and all(a.outcome == AttemptOutcome.SKIPPED for a in exc.attempts)
         logger.warning(
             "provider_all_candidates_failed",
             extra={
                 "team_id": str(team_id),
                 "idempotency_key_id": str(idempotency_key_id),
                 "attempt_count": len(exc.attempts),
-                "last_failure_category": last_category.value if last_category else None,
+                "last_failure_category": (
+                    exc.attempts[-1].failure_category.value
+                    if exc.attempts and exc.attempts[-1].failure_category else None
+                ),
+                "all_attempts_skipped_circuit_open": all_skipped,
             },
         )
+        # A circuit-open skip means we KNOW no request was ever sent --
+        # cost is confirmed zero, not merely "could not be confirmed".
+        error_code = "CIRCUIT_OPEN_NO_ATTEMPT" if all_skipped else "RETRIES_EXHAUSTED_COST_UNKNOWN"
         settle_result = await _settle_and_resolve(
             session_factory, idempotency_key_id, success=False,
-            actual_cost=Decimal("0"), error_code="RETRIES_EXHAUSTED_COST_UNKNOWN",
+            actual_cost=Decimal("0"), error_code=error_code,
             primary_provider="openai", primary_model=model, latency_ms=0,
         )
         replay = await _resolve_authoritative_state_if_not_claimed(session_factory, idempotency_key_id, settle_result)
@@ -802,18 +841,19 @@ async def create_chat_completion(
             record_chat_completion_outcome("replay_completed_race")
             response.headers["Idempotent-Replayed"] = "true"
             return replay
-        if last_category in (FailureCategory.RETRYABLE_PROVIDER_ERROR, FailureCategory.TIMEOUT):
+        if is_transient_failure(exc.attempts):
             record_chat_completion_outcome("provider_unavailable")
+            message = (
+                "the provider's circuit breaker is currently open due to recent failures; "
+                "you were not charged (no request was sent). Retry later with a new Idempotency-Key."
+                if all_skipped else
+                "the provider was unavailable after retries; you were not charged. "
+                "Upstream billing for the failed attempts could not be confirmed. "
+                "Retry later with a new Idempotency-Key."
+            )
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "code": "provider_unavailable",
-                    "message": (
-                        "the provider was unavailable after retries; you were not charged. "
-                        "Upstream billing for the failed attempts could not be confirmed. "
-                        "Retry later with a new Idempotency-Key."
-                    ),
-                },
+                detail={"code": "provider_unavailable", "message": message},
             ) from None
         record_chat_completion_outcome("provider_error")
         raise HTTPException(
