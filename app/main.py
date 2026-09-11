@@ -20,6 +20,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.api.admin import router as admin_router
 from app.api.chat_completions import router as chat_completions_router
 
 from app.config import get_settings
@@ -421,6 +422,7 @@ app.add_middleware(RequestIDMiddleware)
 app.add_middleware(TracingMiddleware)
 
 app.include_router(chat_completions_router)
+app.include_router(admin_router)
 
 app.add_exception_handler(RequestValidationError, _validation_exception_handler)
 

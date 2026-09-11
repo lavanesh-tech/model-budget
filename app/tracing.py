@@ -25,7 +25,7 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 
 _provider = ContextVar("gateway_tracing_provider", default=None)
 _noop = trace.NoOpTracerProvider()
-_ROUTES = frozenset({"/health", "/metrics", "/v1/chat/completions"})
+_ROUTES = frozenset({"/health", "/metrics", "/v1/chat/completions", "/admin/v1/overview", "/admin/v1/teams", "/admin/v1/usage", "/admin/v1/prompt-versions", "/admin/v1/provider-status"})
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
 _STRINGS = {
     "http.request.method": _METHODS | {"_OTHER"},

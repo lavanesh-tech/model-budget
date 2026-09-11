@@ -1,0 +1,4 @@
+"use client";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+export default function Login() { const [password, setPassword] = useState(""); const [error, setError] = useState(""); const router = useRouter(); async function submit(e: React.FormEvent) { e.preventDefault(); const r = await fetch("/api/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password }) }); if (!r.ok) { setError("Invalid credentials"); return; } router.replace("/"); } return <main className="login"><form onSubmit={submit}><h1>ModelBudget</h1><p>Operator dashboard</p><label>Dashboard password<input autoFocus type="password" value={password} onChange={e => setPassword(e.target.value)} required /></label>{error && <p className="error">{error}</p>}<button>Sign in</button></form></main>; }

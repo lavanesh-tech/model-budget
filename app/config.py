@@ -70,6 +70,9 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Step 37: separate operator credential; never a tenant gateway key.
+    admin_api_key: SecretStr | None = None
+
     # Step 35: tracing is opt-in.  The endpoint is intentionally not a
     # SecretStr: OTLP collector addresses are operational configuration, not
     # credentials.  Do not put tokens in the URL; use collector-side auth.
@@ -127,6 +130,13 @@ class Settings(BaseSettings):
     circuit_breaker_failure_threshold: int = 5
 
     circuit_breaker_cooldown_seconds: float = 30.0
+
+    @field_validator("admin_api_key")
+    @classmethod
+    def _admin_api_key_not_blank(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().strip():
+            raise ValueError("admin_api_key must not be blank if provided")
+        return value
 
     @field_validator("openai_api_key")
 
