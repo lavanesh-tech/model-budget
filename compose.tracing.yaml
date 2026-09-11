@@ -1,0 +1,10 @@
+# Separate Compose project: does not modify PostgreSQL or Redis services.
+services:
+  collector:
+    image: otel/opentelemetry-collector:0.160.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "127.0.0.1:4318:4318"
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    mem_limit: 256m
