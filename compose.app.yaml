@@ -1,0 +1,92 @@
+# Step 39: adds the FastAPI gateway and Next.js dashboard as containers
+# in the SAME Compose project as docker-compose.yml's db/redis, via
+# Compose's native multi-file composition:
+#
+#   docker compose -f docker-compose.yml -f compose.app.yaml <command>
+#
+# docker-compose.yml itself is NOT modified -- its db/redis services,
+# healthchecks, and named volumes (pgdata/redisdata) are used as-is.
+#
+# IMPORTANT networking note, found by actually reading the current
+# dashboard/lib/security.mjs (not assumed): backendRequest() only
+# allows a PLAINTEXT http:// backend URL when its hostname is exactly
+# 127.0.0.1, localhost, or [::1] -- any other hostname (including a
+# normal Compose service-name DNS entry like "gateway", and including
+# host.docker.internal) is rejected with "Backend requires HTTPS".
+# Rather than stand up TLS for local verification, or touch that
+# validation, the dashboard container joins the gateway container's
+# OWN network namespace (`network_mode: "service:gateway"`), so
+# `http://127.0.0.1:8000` from INSIDE the dashboard container genuinely
+# reaches the gateway process -- satisfying that check exactly as
+# written, with zero application-code changes. This is why BOTH
+# published ports below are declared on the gateway service: a
+# container using network_mode: "service:X" shares X's network stack
+# entirely and cannot independently publish its own ports.
+#
+# The OpenTelemetry Collector (compose.tracing.yaml) remains a
+# deliberately SEPARATE Compose project on its own host-published port
+# -- unchanged by this file. To send traces from the gateway container
+# to it, set OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318
+# in .env (Docker Desktop for Mac's host-loopback bridge) and start the
+# collector separately first, exactly as already documented.
+#
+# No destructive commands are needed for any of this: `docker compose
+# -f docker-compose.yml -f compose.app.yaml up --build` builds and
+# starts gateway+dashboard against the EXISTING db/redis containers and
+# their EXISTING named volumes -- no data is touched, reset, or
+# recreated.
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set}
+      REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-60}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set}
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+    ports:
+      # Both the gateway's own port AND the dashboard's port (3000) are
+      # published HERE -- see the module-level comment on why the
+      # dashboard has no ports: of its own.
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    network_mode: "service:gateway"
+    environment:
+      NODE_ENV: ${DASHBOARD_NODE_ENV:-development}
+      # 127.0.0.1, not a service name -- see module-level comment.
+      BACKEND_ADMIN_BASE_URL: http://127.0.0.1:8000
+      # Must exactly equal the gateway's own ADMIN_API_KEY above --
+      # app/security/admin_auth.py rejects any mismatch with a 404
+      # (see that file's own fail-closed, existence-hiding design).
+      MODEL_BUDGET_ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set}
+      DASHBOARD_LOGIN_PASSWORD: ${DASHBOARD_LOGIN_PASSWORD:?DASHBOARD_LOGIN_PASSWORD must be set}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:?DASHBOARD_SESSION_SECRET must be set}
+      # dashboard/lib/security.mjs's sameOrigin() REQUIRES this to be a
+      # real https:// origin whenever NODE_ENV=production. For local
+      # Mac verification (NODE_ENV left at its "development" default
+      # above), the loopback-http fallback in that same function is
+      # what actually applies. For a real deployment, override BOTH
+      # DASHBOARD_NODE_ENV=production and DASHBOARD_ORIGIN=https://...
+    depends_on:
+      gateway:
+        condition: service_healthy
