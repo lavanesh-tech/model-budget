@@ -3,3 +3,7 @@ node_modules/
 .env.local
 
 *.tsbuildinfo
+
+/next-env.d.ts
+
+/components/dashboard.tsx.before-chart-fix
