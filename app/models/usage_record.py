@@ -23,6 +23,7 @@ from app.models.enums import UsageStatus
 
 if TYPE_CHECKING:
     from app.models.idempotency_key import IdempotencyKey
+    from app.models.prompt_version import PromptVersion
 
 
 class UsageRecord(Base):
@@ -81,6 +82,14 @@ class UsageRecord(Base):
             "ix_usage_records_created_at",
             "created_at",
         ),
+        # Step 36: supports "which requests used prompt version X" audit
+        # queries. Nullable (a request with no prompt version selected
+        # has no linkage) -- see app.models.prompt_version's own
+        # docstring for the full immutable-versioning design.
+        Index(
+            "ix_usage_records_prompt_version_id",
+            "prompt_version_id",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -137,8 +146,23 @@ class UsageRecord(Base):
         DateTime(timezone=True),
         server_default=func.now(),
     )
+    # Step 36: which immutable prompt version (if any) produced the
+    # effective prompt for this request. Nullable -- a request that did
+    # not select a prompt version has no linkage, exactly preserving
+    # pre-Step-36 rows and behavior. ON DELETE RESTRICT: a prompt
+    # version that has ever been used can never be deleted (it can only
+    # be retired -- see app.models.prompt_version), so this audit trail
+    # can never be silently orphaned.
+    prompt_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("prompt_versions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
 
     idempotency_key: Mapped["IdempotencyKey"] = relationship(
         "IdempotencyKey",
         back_populates="usage_record",
+    )
+    prompt_version: Mapped["PromptVersion | None"] = relationship(
+        "PromptVersion",
+        back_populates="usage_records",
     )

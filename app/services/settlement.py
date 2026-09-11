@@ -67,6 +67,18 @@ module has no way to know what OpenAI may have billed for attempts that
 never returned a usable result -- see app.api.chat_completions' own
 docstring for how that uncertainty is represented to the client (never
 as a confident "zero cost was confirmed").
+
+--- Step 36 addition: optional prompt-version audit linkage ---
+
+settle_success/settle_failure gained one new OPTIONAL keyword argument,
+prompt_version_id (default None), stored verbatim on the created
+UsageRecord -- see app.models.prompt_version's own module docstring for
+the full immutable-versioning design. This is PURE audit linkage: a
+UUID reference, never the prompt template/content itself, which this
+module never sees and never touches. Passing nothing (the default)
+reproduces every prior call site's behavior byte-for-byte -- this is
+why every existing call in app.api.chat_completions that predates Step
+36 needed zero changes to keep working.
 """
 
 import json
@@ -122,6 +134,11 @@ class SettlementResult:
 def _validate_uuid(label: str, value) -> None:
     if not isinstance(value, uuid.UUID):
         raise SettlementValidationError(f"{label} must be a uuid.UUID, got {type(value).__name__}")
+
+
+def _validate_optional_uuid(label: str, value) -> None:
+    if value is not None and not isinstance(value, uuid.UUID):
+        raise SettlementValidationError(f"{label} must be a uuid.UUID or None, got {type(value).__name__}")
 
 
 def _validate_cost(label: str, value, *, allow_zero: bool) -> None:
@@ -249,6 +266,7 @@ def settle_success(
     completion_tokens: int,
     latency_ms: int,
     fallback_used: bool,
+    prompt_version_id: uuid.UUID | None = None,
 ) -> SettlementResult:
     """Settle a successfully-completed request. If actual_cost exceeds
     the authoritative reserved_cost, the team's charge is capped at the
@@ -266,6 +284,7 @@ def settle_success(
     _validate_nonneg_int("completion_tokens", completion_tokens)
     _validate_nonneg_int("latency_ms", latency_ms)
     _validate_bool("fallback_used", fallback_used)
+    _validate_optional_uuid("prompt_version_id", prompt_version_id)
 
     claimed = claim_settlement(
         db, idempotency_key_id, IdempotencyStatus.COMPLETED, response_snapshot=response_snapshot
@@ -293,6 +312,7 @@ def settle_success(
         status=UsageStatus.SUCCEEDED,
         fallback_used=fallback_used,
         error_code=None,
+        prompt_version_id=prompt_version_id,
     )
     db.add(record)
     db.flush()
@@ -317,6 +337,7 @@ def settle_failure(
     completion_tokens: int = 0,
     latency_ms: int,
     fallback_used: bool = False,
+    prompt_version_id: uuid.UUID | None = None,
 ) -> SettlementResult:
     """Settle a request whose provider attempts ultimately failed. Same
     cost-capping policy as settle_success applies if actual_cost happens
@@ -333,6 +354,7 @@ def settle_failure(
     _validate_nonneg_int("completion_tokens", completion_tokens)
     _validate_nonneg_int("latency_ms", latency_ms)
     _validate_bool("fallback_used", fallback_used)
+    _validate_optional_uuid("prompt_version_id", prompt_version_id)
 
     claimed = claim_settlement(db, idempotency_key_id, IdempotencyStatus.FAILED, error_code=error_code)
     if not claimed:
@@ -358,6 +380,7 @@ def settle_failure(
         status=UsageStatus.FAILED,
         fallback_used=fallback_used,
         error_code=error_code,
+        prompt_version_id=prompt_version_id,
     )
     db.add(record)
     db.flush()

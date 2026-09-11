@@ -2,6 +2,12 @@
 
 The API dependency is required even when disabled, but the SDK/exporter is
 loaded and constructed only when enabled. No global tracer provider is changed.
+
+Step 36: added exactly one fixed constant, "db.prompt_version_lookup", to
+_STRINGS["db.operation"] -- the new prompt-version lookup span this step
+introduces uses that db.operation value, which would otherwise be silently
+dropped by this allowlist (see app.api.chat_completions._traced_to_thread).
+No ID, template, prompt, or other unbounded value was added anywhere.
 """
 from __future__ import annotations
 
@@ -24,7 +30,10 @@ _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
 _STRINGS = {
     "http.request.method": _METHODS | {"_OTHER"},
     "http.route": _ROUTES | {"unmatched"},
-    "db.operation": {"db.authenticate", "db.replay_lookup", "db.reservation", "db.settlement", "db.authoritative_state"},
+    "db.operation": {
+        "db.authenticate", "db.replay_lookup", "db.reservation", "db.settlement", "db.authoritative_state",
+        "db.prompt_version_lookup",
+    },
     "openai.operation": {"input_tokens.count", "responses.create"},
     "error.type": {"timeout", "cancelled", "http_error", "operation_error"},
 }
