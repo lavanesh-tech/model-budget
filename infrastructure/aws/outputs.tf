@@ -14,3 +14,8 @@ output "instance_id" {
 output "instance_state" {
   value = aws_instance.app.instance_state
 }
+
+output "cloudfront_distribution_id" {
+  description = "CloudFront distribution used by the on-demand demo runbook."
+  value       = aws_cloudfront_distribution.app.id
+}
