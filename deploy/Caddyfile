@@ -1,0 +1,12 @@
+:80 {
+	encode gzip
+
+	@gateway path /health /metrics /v1/*
+	handle @gateway {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:3000
+	}
+}

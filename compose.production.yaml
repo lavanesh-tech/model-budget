@@ -1,0 +1,81 @@
+services:
+  db:
+    image: postgres:18.6-alpine3.24
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: modelbudget
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: modelbudget
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U modelbudget -d modelbudget"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      ENVIRONMENT: production
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: modelbudget
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: modelbudget
+      REDIS_URL: redis://redis:6379/0
+      OPENAI_MODEL: gpt-5-mini
+      RATE_LIMIT_MAX_REQUESTS: "60"
+      RATE_LIMIT_WINDOW_SECONDS: "60"
+      ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set}
+      OTEL_ENABLED: "false"
+    ports:
+      - "80:80"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    network_mode: "service:gateway"
+    environment:
+      NODE_ENV: production
+      BACKEND_ADMIN_BASE_URL: http://127.0.0.1:8000
+      MODEL_BUDGET_ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY must be set}
+      DASHBOARD_LOGIN_PASSWORD: ${DASHBOARD_LOGIN_PASSWORD:?DASHBOARD_LOGIN_PASSWORD must be set}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:?DASHBOARD_SESSION_SECRET must be set}
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:?DASHBOARD_ORIGIN must be set}
+    depends_on:
+      gateway:
+        condition: service_started
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    network_mode: "service:gateway"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      dashboard:
+        condition: service_started
+
+volumes:
+  pgdata:
