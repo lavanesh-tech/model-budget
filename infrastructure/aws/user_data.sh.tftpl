@@ -1,0 +1,52 @@
+#!/bin/bash
+set -euo pipefail
+
+dnf install -y docker git jq
+systemctl enable --now docker
+
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl --fail --silent --show-error --location \
+  https://github.com/docker/compose/releases/download/v2.40.3/docker-compose-linux-x86_64 \
+  --output /usr/local/lib/docker/cli-plugins/docker-compose
+chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version
+
+if [ ! -f /swapfile ]; then
+  dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+mkdir -p /opt/modelbudget
+if [ ! -d /opt/modelbudget/app/.git ]; then
+  git clone --branch "${repository_ref}" --single-branch "${repository_url}" /opt/modelbudget/app
+else
+  git -C /opt/modelbudget/app fetch origin "${repository_ref}"
+  git -C /opt/modelbudget/app checkout "${repository_ref}"
+  git -C /opt/modelbudget/app reset --hard "origin/${repository_ref}"
+fi
+
+get_secret() {
+  aws ssm get-parameter \
+    --region "${aws_region}" \
+    --name "$1" \
+    --with-decryption \
+    --query 'Parameter.Value' \
+    --output text
+}
+
+umask 077
+cat > /opt/modelbudget/app/.env.production <<EOF
+POSTGRES_PASSWORD=$(get_secret /modelbudget/prod/postgres-password)
+ADMIN_API_KEY=$(get_secret /modelbudget/prod/admin-api-key)
+DASHBOARD_LOGIN_PASSWORD=$(get_secret /modelbudget/prod/dashboard-login-password)
+DASHBOARD_SESSION_SECRET=$(get_secret /modelbudget/prod/dashboard-session-secret)
+DASHBOARD_ORIGIN=https://placeholder.invalid
+EOF
+
+cd /opt/modelbudget/app
+docker compose --env-file .env.production -f compose.production.yaml build
+docker compose --env-file .env.production -f compose.production.yaml run --rm gateway alembic upgrade head
+docker compose --env-file .env.production -f compose.production.yaml up -d
